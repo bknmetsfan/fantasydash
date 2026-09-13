@@ -500,12 +500,16 @@ def build_feed(book, players=None, scoring_by_tag=None):
             q = pl.get("period", {}).get("number")
             stats_by_pid = play_stats(pl, roles, text)
             def deltas(h):
-                d = {}
+                d, mults = {}, {}
                 for tag in list(h["for"]) + list(h["against"]):
                     sc = (scoring_by_tag or {}).get(tag.replace(" (bench)", ""))
                     if sc is not None:
-                        d[tag] = price(stats_by_pid.get(h["id"], {}), sc["scoring"], sc.get("key"))
-                return d
+                        base = price(stats_by_pid.get(h["id"], {}), sc["scoring"], sc.get("key"))
+                        m = (sc.get("mults") or {}).get(h["id"], 1)
+                        d[tag] = round(base * m, 2)
+                        if m != 1:
+                            mults[tag] = {"base": base, "mult": m}
+                return d, mults
             out.append({
                 "id": pl.get("id"), "ts": ts, "t": time.strftime("%H:%M", time.localtime(ts)),
                 "game": g["label"], "q": f"Q{q}" if q and q <= 4 else "OT",
@@ -513,7 +517,8 @@ def build_feed(book, players=None, scoring_by_tag=None):
                 "text": re.sub(r"^\((?:Shotgun|No Huddle|No Huddle, Shotgun)\)\s*", "", text),
                 "scoring": bool(pl.get("scoringPlay")),
                 "players": [{"id": h["id"], "name": h["name"], "for": h["for"], "against": h["against"],
-                             "pts": h["pts"], "role": roles.get(h["id"], ""), "deltas": deltas(h)}
+                             "pts": h["pts"], "role": roles.get(h["id"], ""),
+                             "deltas": deltas(h)[0], "mults": deltas(h)[1]}
                             for h in hits.values()],
             })
     out.sort(key=lambda e: -e["ts"])
@@ -1266,7 +1271,8 @@ def build():
                 pl = players.get(b["id"], {})
                 watch[b["id"]] = {"id": b["id"], "name": pl.get("name", b["id"]), "team": pl.get("team", ""),
                                   "pts": b["pts"], "for": [tag], "against": []}
-    scoring_by_tag = {lg["name"][:14]: {"scoring": lg.get("scoring"), "key": lg.get("scoring_key")}
+    scoring_by_tag = {lg["name"][:14]: {"scoring": lg.get("scoring"), "key": lg.get("scoring_key"),
+                                        "mults": lg.get("mults") or {}}
                       for lg in out_leagues if lg["mode"] != "error"}
     feed = build_feed(list(watch.values()), players, scoring_by_tag)
     log_snapshot(CONFIG["season"], week, out_leagues)   # pops the _log rows
@@ -1593,7 +1599,12 @@ function feedRows(feed){
   if (!feed || !feed.length) return '<div class="pos" style="padding:6px 0 10px">No plays involving your players in games currently in progress.</div>';
   const shown = showMinor ? feed : feed.slice(0, 12);
   const rows = shown.map(e => {
-    const dfmt = (p, tag) => { const v = (p.deltas || {})[tag]; return v == null ? '' : ` <span class="num">${v > 0 ? '+' : ''}${v.toFixed(1)}</span>`; };
+    const dfmt = (p, tag) => {
+      const v = (p.deltas || {})[tag]; if (v == null) return '';
+      const m = (p.mults || {})[tag];
+      const total = `<span class="num">${v > 0 ? '+' : ''}${v.toFixed(1)}</span>`;
+      return m ? ` <span class="pos num" style="font-size:11.5px">${m.base > 0 ? '+' : ''}${m.base.toFixed(1)}×${m.mult}</span> = ${total}` : ` ${total}`;
+    };
     const tagList = side => { const seen = new Set(); return e.players.flatMap(p => p[side].map(t => `${t}${dfmt(p, t)}`)).filter(x => !seen.has(x) && seen.add(x)).join('<br>'); };
     const fors = tagList('for'), agst = tagList('against');
     const who = e.players.map(p => `<b>${p.name}</b>${p.role ? ` <span class="pos">(${p.role})</span>` : ''}${p.pts != null ? ` <span class="num pos">${p.pts.toFixed(1)}</span>` : ''}`).join('<br>');
