@@ -305,6 +305,8 @@ def rival_point_value(me, rival, rest, delta=2.0):
 
 ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
 ESPN_UA = {"User-Agent": "curl/8.0"}          # Akamai rejects fake browser UAs here
+FEED_SKIP_TYPES = {"Kickoff", "Pass Incompletion", "Sack", "Penalty", "Punt", "Kneel", "Spike",
+                   "Official Timeout", "Coin Toss"}
 PLAY_ROLES = {"passer", "rusher", "receiver", "kicker", "returner", "scorer", "fumbler",
               "puntReturner", "kickReturner", "interceptedBy", "recoveredBy"}
 
@@ -375,7 +377,13 @@ def build_feed(book, players):
             ptype = (pl.get("type") or {}).get("text", "")
             if not text or ptype in ("Two-minute warning", "End Period", "End of Half", "End of Game", "Timeout"):
                 continue
-            if ptype == "Kickoff" and not pl.get("scoringPlay"):
+            # Only plays that move a fantasy score: drop incompletions, sacks,
+            # penalties, punts, kneels, spikes and non-scoring kickoffs.
+            if not pl.get("scoringPlay") and (
+                ptype in FEED_SKIP_TYPES
+                or "pass incomplete" in text.lower()
+                or "penalty" in ptype.lower()
+            ):
                 continue
             hits = {}
             for part in pl.get("participants") or []:
