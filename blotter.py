@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sunday blotter - live cross-league fantasy exposure.
+fantasydash - live cross-league fantasy exposure.
 
 Run:  python blotter.py
 Then: http://127.0.0.1:5000
@@ -67,6 +67,8 @@ _games_cache = {"key": None, "ts": 0.0, "data": {}}
 _stats_cache = {"key": None, "ts": 0.0, "data": {}}
 _log_last = {"ts": 0.0}
 OT_TEAMS = set()          # teams currently in overtime, for the "left" column
+_feed = {"prev": None, "events": []}   # last book keyed by pid, and the rolling scoring feed
+FEED_MAX = 150
 
 
 # ----------------------------------------------------------------------------
@@ -298,6 +300,78 @@ def rival_point_value(me, rival, rest, delta=2.0):
     up = np.mean(me > np.minimum(rest, rival + delta))
     dn = np.mean(me > np.minimum(rest, rival - delta))
     return round(100 * float(up - dn) / (2 * delta), 3)
+
+
+def describe_delta(new, old):
+    """Human summary of what changed in a stat line between two snapshots."""
+    d = lambda k: (new.get(k) or 0) - (old.get(k) or 0)
+    bits = []
+    if d("pass_td"):
+        bits.append(f"{int(d('pass_td'))} pass TD")
+    if d("rush_td"):
+        bits.append(f"{int(d('rush_td'))} rush TD")
+    if d("rec_td"):
+        bits.append(f"{int(d('rec_td'))} rec TD")
+    if d("rec"):
+        bits.append(f"{int(d('rec'))} rec {int(d('rec_yd'))} yd")
+    elif d("rec_yd"):
+        bits.append(f"{int(d('rec_yd'))} rec yd")
+    if d("rush_att"):
+        bits.append(f"{int(d('rush_att'))} car {int(d('rush_yd'))} yd")
+    elif d("rush_yd"):
+        bits.append(f"{int(d('rush_yd'))} rush yd")
+    if d("pass_att") or d("pass_yd"):
+        bits.append(f"{int(d('pass_cmp'))}/{int(d('pass_att'))} {int(d('pass_yd'))} pyd")
+    if d("pass_int"):
+        bits.append(f"{int(d('pass_int'))} INT")
+    if d("fum_lost"):
+        bits.append("fumble lost")
+    if d("fgm"):
+        bits.append(f"FG {int(d('fgm'))}")
+    if d("xpm"):
+        bits.append(f"XP {int(d('xpm'))}")
+    if d("sack"):
+        bits.append(f"{int(d('sack'))} sack")
+    if d("int") or d("fum_rec"):
+        bits.append("takeaway")
+    if d("def_td"):
+        bits.append("DEF TD")
+    if d("pts_allow"):
+        bits.append(f"{int(d('pts_allow'))} pts allowed")
+    return ", ".join(bits)
+
+
+def update_feed(book, stats):
+    """
+    Diff this build's book against the last one; one event per player whose
+    points moved. Carries the leagues touched and the swing in your odds
+    (delta x root, in percentage points). Yardage-only ticks are kept but
+    small ones are tagged minor so the UI can fold them.
+    """
+    prev = _feed["prev"] or {}
+    now = time.strftime("%H:%M")
+    new_events = []
+    for p in book:
+        pid = p["id"]
+        old = prev.get(pid)
+        if old is None or p["pts"] is None:
+            continue
+        delta = round(p["pts"] - (old["pts"] or 0.0), 2)
+        if abs(delta) < 0.05:
+            continue
+        what = describe_delta(stats.get(pid) or {}, old["stats"] or {})
+        new_events.append({
+            "t": now, "ts": time.time(), "pid": pid, "name": p["name"], "pos": p["pos"], "team": p["team"],
+            "delta": delta, "pts": p["pts"], "what": what,
+            "for": p["for"], "against": p["against"],
+            "swing": round(delta * p["root"], 1),
+            "minor": abs(delta) < 1.5 and "TD" not in what and "INT" not in what and "fumble" not in what,
+        })
+    # Biggest swings first within the same tick, then newest overall.
+    new_events.sort(key=lambda e: -abs(e["swing"]))
+    _feed["events"] = (new_events + _feed["events"])[:FEED_MAX]
+    _feed["prev"] = {p["id"]: {"pts": p["pts"], "stats": dict(stats.get(p["id"]) or {})} for p in book}
+    return _feed["events"]
 
 
 def win_pct(a, b):
@@ -957,11 +1031,12 @@ def build():
     # Sort by what is still at stake tonight, then by how much each point matters.
     book.sort(key=lambda x: (-abs(x["impact"]), -abs(x["root"])))
 
+    feed = update_feed(book, stats)
     log_snapshot(CONFIG["season"], week, out_leagues)   # pops the _log rows
     for lg in out_leagues:
         lg.pop("_log", None)
 
-    return {"week": week, "leagues": out_leagues, "book": book,
+    return {"week": week, "leagues": out_leagues, "book": book, "feed": feed,
             "updated": time.strftime("%H:%M:%S")}
 
 
@@ -1042,7 +1117,7 @@ def index():
 PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sunday blotter</title>
+<title>fantasydash</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -1058,9 +1133,14 @@ PAGE = r"""<!doctype html>
   .num{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums}
   h1{font-size:15px;font-weight:600;margin:0;letter-spacing:.01em}
   header{display:flex;justify-content:space-between;align-items:baseline;
-         border-bottom:1.5px solid var(--ink);padding-bottom:8px;margin-bottom:22px}
+         border-bottom:1.5px solid var(--ink);padding-bottom:8px;margin-bottom:16px}
+  #app > h2:first-child{margin-top:0}
   header .meta{font-size:12.5px;color:var(--mute)}
   h2{font-size:13px;font-weight:600;color:var(--mute);margin:30px 0 10px}
+  h2.sec{cursor:pointer;user-select:none}
+  h2.sec:hover{color:var(--ink)}
+  h2 .caret{display:inline-block;width:12px;font-size:11px}
+  h2 .cnt{font-weight:400;opacity:.7;margin-left:4px}
 
   /* chop-line hero */
   .chop{background:var(--panel);border-left:3px solid var(--ink);
@@ -1106,6 +1186,11 @@ PAGE = r"""<!doctype html>
   .detail table.lineup td{white-space:nowrap}
   .detail table.lineup td:nth-child(3){white-space:normal;font-size:12px;min-width:160px}
   .detail h3 .num{color:var(--ink)}
+  .fev{display:grid;grid-template-columns:44px 1fr 52px 2fr 56px 1.4fr;gap:10px;align-items:baseline;
+       padding:5px 0;border-bottom:1px solid var(--rule);font-size:13.5px}
+  .fev.minor{opacity:.65}
+  .fev .fd,.fev .fs{text-align:right}
+  .fev .fwhat{font-size:12.5px}
   .pick{margin:0 0 18px;font-size:13px;color:var(--mute)}
   .pick select{font:inherit;padding:4px 8px;border:1px solid var(--rule);background:var(--panel);color:var(--ink)}
   @media (prefers-reduced-motion:no-preference){
@@ -1113,7 +1198,7 @@ PAGE = r"""<!doctype html>
   }
 </style>
 <header>
-  <h1 id="h1">Sunday blotter</h1>
+  <h1 id="h1">fantasydash</h1>
   <div class="meta num" id="meta">loading</div>
 </header>
 <div id="app"></div>
@@ -1121,6 +1206,17 @@ PAGE = r"""<!doctype html>
 const $ = s => document.querySelector(s);
 if (typeof LEAGUE_ID === 'undefined') window.LEAGUE_ID = null;
 const open = new Set();   // league ids with the drill-down expanded; survives re-render
+let showMinor = false;    // feed: include small yardage ticks
+const collapsed = new Set((() => { try { return JSON.parse(localStorage.getItem('collapsed') || '[]'); } catch(e){ return []; } })());
+function toggleSection(id){
+  collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
+  try { localStorage.setItem('collapsed', JSON.stringify([...collapsed])); } catch(e){}
+  tick();
+}
+function section(id, title, body, count){
+  const c = collapsed.has(id);
+  return `<h2 class="sec" onclick="toggleSection('${id}')"><span class="caret">${c ? '▸' : '▾'}</span> ${title}${count !== undefined ? ` <span class="cnt">${count}</span>` : ''}</h2>${c ? '' : body}`;
+}
 function toggle(id){ open.has(id) ? open.delete(id) : open.add(id); tick(); }
 const f2 = x => (x ?? 0).toFixed(2);
 const tp = t => t ? `${t[0]} to play${t[1] ? ` (${t[1]} live)` : ''}` : '';
@@ -1243,6 +1339,25 @@ function playerDetail(p){
     </table></div></td></tr>`;
 }
 
+function feedRows(feed){
+  if (!feed || !feed.length) return '<div class="pos" style="padding:6px 0 10px">Nothing yet — events appear as your players score.</div>';
+  const shown = showMinor ? feed : feed.filter(e => !e.minor);
+  const sgn = x => x > 0 ? 'long' : (x < 0 ? 'short' : 'pos');
+  const rows = shown.slice(0, 40).map(e => {
+    const tags = [...e.for, ...e.against.map(x => '¬' + x)].join(', ');
+    return `<div class="fev ${e.minor ? 'minor' : ''}">
+      <span class="num pos ft">${e.t}</span>
+      <span class="fname">${e.name} <span class="pos">${e.pos} ${e.team}</span></span>
+      <span class="num fd ${sgn(e.delta)}">${e.delta > 0 ? '+' : ''}${e.delta.toFixed(1)}</span>
+      <span class="fwhat pos">${e.what || '—'}</span>
+      <span class="num fs ${sgn(e.swing)}" title="swing in your odds, pp">${e.swing ? (e.swing > 0 ? '+' : '') + e.swing.toFixed(1) + '%' : ''}</span>
+      <span class="tags">${tags}</span>
+    </div>`;
+  }).join('');
+  const hidden = feed.length - shown.length;
+  return rows + `<div class="pos" style="font-size:12px;margin-top:6px"><a href="#" onclick="showMinor=!showMinor;tick();return false">${showMinor ? 'hide' : 'show'} minor ticks${hidden ? ` (${hidden})` : ''}</a></div>`;
+}
+
 function bookRows(book){
   const sgn = x => x > 0 ? 'long' : (x < 0 ? 'short' : 'pos');
   return book.map(p => {
@@ -1300,12 +1415,13 @@ async function tick(){
   const errors= d.leagues.filter(l => l.mode === 'error');
 
   let html = errors.map(l => `<div class="err">${l.name}: ${l.error}</div>`).join('');
-  if (pools.length) html += pools.map(chopCard).join('');
-  if (h2h.length) html += `<h2>Head to head</h2>` + h2h.map(h2hRow).join('');
-  if (manual.length) html += `<h2>Solo</h2>` + manual.map(manualRow).join('');
-  html += `<h2>Exposure</h2><table>
+  if (pools.length) html += section('pools', 'Guillotine', pools.map(chopCard).join(''));
+  if (h2h.length) html += section('h2h', 'Head to head', h2h.map(h2hRow).join(''));
+  if (manual.length) html += section('solo', 'Solo', manual.map(manualRow).join(''));
+  html += section('feed', 'Feed', feedRows(d.feed), (d.feed || []).filter(e => !e.minor).length);
+  html += section('book', 'Exposure', `<table>
     <tr><th>Player</th><th class="r">Pts</th><th class="r">Proj final</th><th class="r" title="root x remaining projection: swing still on the table">Impact</th><th class="r" title="pp of survival/win per fantasy point, summed over leagues">Root /pt</th><th>Leagues</th></tr>
-    ${bookRows(d.book)}</table>`;
+    ${bookRows(d.book)}</table>`, d.book.length);
   if (manual.length){
     const bad = manual.flatMap(m => m.unmatched);
     if (bad.length) html += `<div class="err">Unmatched names in manual.json: ${bad.join(', ')}. Fix the spelling to fold them into exposure.</div>`;
