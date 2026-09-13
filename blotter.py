@@ -67,9 +67,8 @@ _games_cache = {"key": None, "ts": 0.0, "data": {}}
 _stats_cache = {"key": None, "ts": 0.0, "data": {}}
 _log_last = {"ts": 0.0}
 OT_TEAMS = set()          # teams currently in overtime, for the "left" column
-_feed = {"prev": None, "events": []}   # last book keyed by pid, and the rolling scoring feed
-FEED_MAX = 150
-FEED_MERGE_S = 90         # follow-up ticks for the same player fold into one event
+_plays_cache = {}         # espn game id -> {"ts", "plays", "teams"}
+FEED_MAX = 60             # plays shown in the feed
 
 
 # ----------------------------------------------------------------------------
@@ -304,86 +303,112 @@ def rival_point_value(me, rival, rest, delta=2.0):
     return round(100 * float(up - dn) / (2 * delta), 3)
 
 
-def describe_delta(new, old):
-    """Human summary of what changed in a stat line between two snapshots."""
-    d = lambda k: (new.get(k) or 0) - (old.get(k) or 0)
-    bits = []
-    if d("pass_td"):
-        bits.append(f"{int(d('pass_td'))} pass TD")
-    if d("rush_td"):
-        bits.append(f"{int(d('rush_td'))} rush TD")
-    if d("rec_td"):
-        bits.append(f"{int(d('rec_td'))} rec TD")
-    if d("rec"):
-        bits.append(f"{int(d('rec'))} rec {int(d('rec_yd'))} yd")
-    elif d("rec_yd"):
-        bits.append(f"{int(d('rec_yd'))} rec yd")
-    if d("rush_att"):
-        bits.append(f"{int(d('rush_att'))} car {int(d('rush_yd'))} yd")
-    elif d("rush_yd"):
-        bits.append(f"{int(d('rush_yd'))} rush yd")
-    if d("pass_att") or d("pass_yd"):
-        bits.append(f"{int(d('pass_cmp'))}/{int(d('pass_att'))} {int(d('pass_yd'))} pyd")
-    if d("pass_int"):
-        bits.append(f"{int(d('pass_int'))} INT")
-    if d("fum_lost"):
-        bits.append("fumble lost")
-    if d("fgm"):
-        bits.append(f"FG {int(d('fgm'))}")
-    if d("xpm"):
-        bits.append(f"XP {int(d('xpm'))}")
-    if d("sack"):
-        bits.append(f"{int(d('sack'))} sack")
-    if d("int") or d("fum_rec"):
-        bits.append("takeaway")
-    if d("def_td"):
-        bits.append("DEF TD")
-    if d("pts_allow"):
-        bits.append(f"{int(d('pts_allow'))} pts allowed")
-    return ", ".join(bits)
+ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
+ESPN_UA = {"User-Agent": "curl/8.0"}          # Akamai rejects fake browser UAs here
+PLAY_ROLES = {"passer", "rusher", "receiver", "kicker", "returner", "scorer", "fumbler",
+              "puntReturner", "kickReturner", "interceptedBy", "recoveredBy"}
 
 
-def update_feed(book, stats):
+def load_plays():
     """
-    Diff this build's book against the last one; one event per player whose
-    points moved. Carries the leagues touched and the swing in your odds
-    (delta x root, in percentage points). Yardage-only ticks are kept but
-    small ones are tagged minor so the UI can fold them.
+    Recent plays from every in-progress game, via ESPN's public play-by-play.
+    Each game's play list is cached one poll; finished games keep their last
+    cached plays for the rest of the process so the feed doesn't empty at
+    the final whistle.
     """
-    prev = _feed["prev"] or {}
-    now = time.strftime("%H:%M")
-    ts = time.time()
-    events = _feed["events"]
-    new_events = []
+    try:
+        sb = requests.get(f"{ESPN_SITE}/scoreboard", headers=ESPN_UA, timeout=10).json()
+    except Exception:
+        return _plays_cache
+    for ev in sb.get("events", []):
+        gid = ev["id"]
+        state = ev["status"]["type"]["state"]
+        c = _plays_cache.get(gid)
+        if state != "in" and c:
+            continue                      # keep what we had
+        if state != "in":
+            continue
+        if c and time.time() - c["ts"] < CONFIG["poll_seconds"]:
+            continue
+        try:
+            sm = requests.get(f"{ESPN_SITE}/summary?event={gid}", headers=ESPN_UA, timeout=15).json()
+        except Exception:
+            continue
+        drives = sm.get("drives") or {}
+        raw = []
+        for d in drives.get("previous") or []:
+            raw.extend(d.get("plays") or [])
+        if drives.get("current"):
+            raw.extend(drives["current"].get("plays") or [])
+        seen, plays = set(), []
+        for pl in raw:                    # current drive is also in previous
+            if pl.get("id") in seen:
+                continue
+            seen.add(pl.get("id"))
+            plays.append(pl)
+        teams = {c["id"]: ESPN_TEAM_FIX.get(c["team"]["abbreviation"], c["team"]["abbreviation"])
+                 for c in (sm.get("header", {}).get("competitions") or [{}])[0].get("competitors", [])}
+        _plays_cache[gid] = {"ts": time.time(), "plays": plays[-80:], "teams": teams,
+                             "label": ev.get("shortName", "")}
+    return _plays_cache
+
+
+_INITIAL_LAST = re.compile(r"\b([A-Z])\.\s?([A-Z][A-Za-z'\-]+)")
+
+
+def build_feed(book, players):
+    """
+    Plays involving anyone in the book, newest first. Players are matched
+    from ESPN's participant list (full names), falling back to the
+    'J.Gibbs' tokens in the play text matched by initial + surname + team.
+    """
+    by_name, by_init = {}, {}
     for p in book:
-        pid = p["id"]
-        old = prev.get(pid)
-        cur_stats = stats.get(pid) or {}
-        if old is None or p["pts"] is None:
-            continue
-        pts_moved = abs(p["pts"] - (old["pts"] or 0.0)) >= 0.05
-        stats_moved = cur_stats != (old["stats"] or {})
-        if not (pts_moved or stats_moved):
-            continue
-        # Same player within the merge window: extend the existing event so a
-        # drive reads as one line and the stat line can catch up with the points.
-        ev = next((e for e in events if e["pid"] == pid and ts - e["ts"] < FEED_MERGE_S), None)
-        if ev is None:
-            ev = {"t": now, "ts": ts, "pid": pid, "name": p["name"], "pos": p["pos"], "team": p["team"],
-                  "base_pts": old["pts"] or 0.0, "base_stats": dict(old["stats"] or {}),
-                  "for": p["for"], "against": p["against"]}
-            new_events.append(ev)
-        ev["ts"] = ts
-        ev["delta"] = round(p["pts"] - ev["base_pts"], 2)
-        ev["pts"] = p["pts"]
-        ev["what"] = describe_delta(cur_stats, ev["base_stats"])
-        ev["swing"] = round(ev["delta"] * p["root"], 1)
-        ev["minor"] = abs(ev["delta"]) < 1.5 and not any(k in ev["what"] for k in ("TD", "INT", "fumble", "takeaway"))
-    new_events.sort(key=lambda e: -abs(e["swing"]))
-    events = [e for e in new_events + events if abs(e["delta"]) >= 0.05 or e["what"]]
-    _feed["events"] = events[:FEED_MAX]
-    _feed["prev"] = {p["id"]: {"pts": p["pts"], "stats": dict(stats.get(p["id"]) or {})} for p in book}
-    return _feed["events"]
+        by_name[norm(p["name"])] = p
+        last = norm(p["name"].split()[-1]) if p["name"].split() else ""
+        by_init[(p["name"][:1].upper(), last, p["team"])] = p
+    out = []
+    for gid, g in load_plays().items():
+        game_teams = set(g["teams"].values())
+        for pl in g["plays"]:
+            text = (pl.get("text") or "").strip()
+            ptype = (pl.get("type") or {}).get("text", "")
+            if not text or ptype in ("Two-minute warning", "End Period", "End of Half", "End of Game", "Timeout"):
+                continue
+            if ptype == "Kickoff" and not pl.get("scoringPlay"):
+                continue
+            hits = {}
+            for part in pl.get("participants") or []:
+                if part.get("type") in PLAY_ROLES:
+                    hit = by_name.get(norm(part.get("athlete", {}).get("displayName", "")))
+                    if hit:
+                        hits[hit["id"]] = hit
+            if not hits:
+                for ini, last in _INITIAL_LAST.findall(text):
+                    for t in game_teams:
+                        hit = by_init.get((ini, norm(last), t))
+                        if hit:
+                            hits[hit["id"]] = hit
+            if not hits:
+                continue
+            try:
+                ts = time.mktime(time.strptime(pl.get("wallclock", "")[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+                if time.localtime(ts).tm_isdst:
+                    ts += 3600
+            except (ValueError, TypeError):
+                ts = time.time()
+            q = pl.get("period", {}).get("number")
+            out.append({
+                "id": pl.get("id"), "ts": ts, "t": time.strftime("%H:%M", time.localtime(ts)),
+                "game": g["label"], "q": f"Q{q}" if q and q <= 4 else "OT",
+                "clock": (pl.get("clock") or {}).get("displayValue", ""),
+                "text": re.sub(r"^\((?:Shotgun|No Huddle|No Huddle, Shotgun)\)\s*", "", text),
+                "scoring": bool(pl.get("scoringPlay")),
+                "players": [{"id": h["id"], "name": h["name"], "for": h["for"], "against": h["against"],
+                             "pts": h["pts"]} for h in hits.values()],
+            })
+    out.sort(key=lambda e: -e["ts"])
+    return out[:FEED_MAX]
 
 
 def win_pct(a, b):
@@ -1043,7 +1068,7 @@ def build():
     # Sort by what is still at stake tonight, then by how much each point matters.
     book.sort(key=lambda x: (-abs(x["impact"]), -abs(x["root"])))
 
-    feed = [{k: v for k, v in e.items() if not k.startswith("base_")} for e in update_feed(book, stats)]
+    feed = build_feed(book, players)
     log_snapshot(CONFIG["season"], week, out_leagues)   # pops the _log rows
     for lg in out_leagues:
         lg.pop("_log", None)
@@ -1198,9 +1223,10 @@ PAGE = r"""<!doctype html>
   .detail table.lineup td{white-space:nowrap}
   .detail table.lineup td:nth-child(3){white-space:normal;font-size:12px;min-width:160px}
   .detail h3 .num{color:var(--ink)}
-  .fev{display:grid;grid-template-columns:44px 1fr 52px 2fr 1.2fr 1.2fr;gap:10px;align-items:baseline;
-       padding:5px 0;border-bottom:1px solid var(--rule);font-size:13.5px}
-  .fev.minor{opacity:.65}
+  .fev{display:grid;grid-template-columns:52px 1.1fr 2.4fr 1fr 1fr;gap:10px;align-items:baseline;
+       padding:6px 0;border-bottom:1px solid var(--rule);font-size:13.5px}
+  .fev.score .fwhat{color:var(--ink);font-weight:500}
+  .fev.score{background:var(--panel)}
   .fev.fhead{font-size:12px;color:var(--mute);font-weight:500}
   .fev .fd{text-align:right}
   .fev .tags{padding-left:0;font-weight:400}
@@ -1220,7 +1246,7 @@ PAGE = r"""<!doctype html>
 const $ = s => document.querySelector(s);
 if (typeof LEAGUE_ID === 'undefined') window.LEAGUE_ID = null;
 const open = new Set();   // league ids with the drill-down expanded; survives re-render
-let showMinor = false;    // feed: include small yardage ticks
+let showMinor = false;    // feed: show the full list instead of the last 12
 const collapsed = new Set((() => { try { return JSON.parse(localStorage.getItem('collapsed') || '[]'); } catch(e){ return []; } })());
 function toggleSection(id){
   collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
@@ -1354,20 +1380,23 @@ function playerDetail(p){
 }
 
 function feedRows(feed){
-  if (!feed || !feed.length) return '<div class="pos" style="padding:6px 0 10px">Nothing yet — events appear as your players score.</div>';
-  const shown = showMinor ? feed : feed.filter(e => !e.minor);
-  const sgn = x => x > 0 ? 'long' : (x < 0 ? 'short' : 'pos');
-  const rows = shown.slice(0, 40).map(e => `<div class="fev ${e.minor ? 'minor' : ''}">
-      <span class="num pos ft">${e.t}</span>
-      <span class="fname">${e.name} <span class="pos">${e.pos} ${e.team}</span></span>
-      <span class="num fd ${sgn(e.delta)}">${e.delta > 0 ? '+' : ''}${e.delta.toFixed(1)}</span>
-      <span class="fwhat pos">${e.what || '—'}</span>
-      <span class="tags long">${e.for.join(', ')}</span>
-      <span class="tags short">${e.against.join(', ')}</span>
-    </div>`).join('');
-  const hidden = feed.length - shown.length;
-  const head = `<div class="fev fhead"><span></span><span>Player</span><span class="fd">Pts</span><span>What happened</span><span>Yours in</span><span>Against in</span></div>`;
-  return head + rows + `<div class="pos" style="font-size:12px;margin-top:6px"><a href="#" onclick="showMinor=!showMinor;tick();return false">${showMinor ? 'hide' : 'show'} minor ticks${hidden ? ` (${hidden})` : ''}</a></div>`;
+  if (!feed || !feed.length) return '<div class="pos" style="padding:6px 0 10px">No plays involving your players in games currently in progress.</div>';
+  const shown = showMinor ? feed : feed.slice(0, 12);
+  const rows = shown.map(e => {
+    const fors = [...new Set(e.players.flatMap(p => p.for))].join(', ');
+    const agst = [...new Set(e.players.flatMap(p => p.against))].join(', ');
+    const who = e.players.map(p => `<b>${p.name}</b>${p.pts != null ? ` <span class="num pos">${p.pts.toFixed(1)}</span>` : ''}`).join(', ');
+    return `<div class="fev ${e.scoring ? 'score' : ''}">
+      <span class="num pos ft">${e.t}<br><span style="font-size:11px">${e.q} ${e.clock}</span></span>
+      <span class="fname">${who}<br><span class="pos" style="font-size:12px">${e.game}</span></span>
+      <span class="fwhat ${e.scoring ? '' : 'pos'}">${e.text}</span>
+      <span class="tags long">${fors}</span>
+      <span class="tags short">${agst}</span>
+    </div>`;
+  }).join('');
+  const head = `<div class="fev fhead"><span></span><span>Player</span><span>Play</span><span>Yours in</span><span>Against in</span></div>`;
+  const more = feed.length > 12 ? `<div class="pos" style="font-size:12px;margin-top:6px"><a href="#" onclick="showMinor=!showMinor;tick();return false">${showMinor ? 'show fewer' : `show all ${feed.length}`}</a></div>` : '';
+  return head + rows + more;
 }
 
 function bookRows(book){
@@ -1430,7 +1459,7 @@ async function tick(){
   if (pools.length) html += section('pools', 'Guillotine', pools.map(chopCard).join(''));
   if (h2h.length) html += section('h2h', 'Head to head', h2h.map(h2hRow).join(''));
   if (manual.length) html += section('solo', 'Solo', manual.map(manualRow).join(''));
-  html += section('feed', 'Feed', feedRows(d.feed), (d.feed || []).filter(e => !e.minor).length);
+  html += section('feed', 'Feed', feedRows(d.feed), (d.feed || []).length);
   html += section('book', 'Exposure', `<table>
     <tr><th>Player</th><th class="r">Pts</th><th class="r">Proj final</th><th class="r" title="root x remaining projection: swing still on the table">Impact</th><th class="r" title="pp of survival/win per fantasy point, summed over leagues">Root /pt</th><th>Leagues</th></tr>
     ${bookRows(d.book)}</table>`, d.book.length);
