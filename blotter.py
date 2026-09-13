@@ -40,7 +40,11 @@ CONFIG = {
     "log_seconds": 60,           # min gap between calibration snapshots (0 = off)
     # Guillotine leagues whose /l/<id> page is open (no password) so
     # leaguemates can pick their own team and see the chop picture.
-    "shared_leagues": ["1400335104223485952"],   # Paris in 1795v2
+    "shared_leagues": [
+        "1400335104223485952",   # Paris in 1795v2
+        "1389721132256473088",   # Degenerates
+        "1389387283332874240",   # The Red Queen's League
+    ],
     # How much you care, per league id (default 1.0). Scales the rooting
     # interest of every player in that league. Rebuilding dynasty teams are
     # "my guys, but not this year".
