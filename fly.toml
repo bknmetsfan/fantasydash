@@ -1,5 +1,5 @@
 # fly launch --copy-config --no-deploy   (then set secrets, create volume, deploy)
-app = "ff-blotter"
+app = "fantasydash"
 primary_region = "ewr"
 
 [build]
