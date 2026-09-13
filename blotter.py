@@ -1385,20 +1385,17 @@ PAGE = r"""<!doctype html>
   h2 .caret{display:inline-block;width:12px;font-size:11px}
   h2 .cnt{font-weight:400;opacity:.7;margin-left:4px}
 
-  /* chop-line hero */
-  .chop{background:var(--panel);border-left:3px solid var(--ink);
-        padding:14px 16px;margin-bottom:10px}
-  .chop .lg{font-size:13px;color:var(--mute);margin-bottom:6px}
+  /* chop-line rows: same scale as the h2h rows, coloured edge for danger */
+  .chop{border-left:3px solid var(--rule);padding:7px 0 7px 12px;
+        border-bottom:1px solid var(--rule);font-size:14px}
+  .chop .l1,.chop .l2{display:flex;justify-content:space-between;gap:16px;align-items:baseline}
+  .chop .l2{font-size:12.5px;margin-top:2px}
   .chop .lg b{font-weight:600;color:var(--ink)}
-  .chop .big{font-size:40px;font-weight:600;line-height:1;letter-spacing:-.02em}
-  .chop .big small{font-size:14px;font-weight:400;color:var(--mute);margin-left:8px;
-                   letter-spacing:0}
+  .chop .big{font-size:16px;font-weight:600}
+  .chop .r1{text-align:right;white-space:nowrap}
+  .warnc{color:var(--warn);font-weight:500}
   .chop.danger{border-left-color:var(--short)}
-  .chop.danger .big{color:var(--short)}
   .chop.thin{border-left-color:var(--warn)}
-  .neighbors{display:flex;gap:26px;margin-top:12px;font-size:13px;color:var(--mute)}
-  .neighbors b{font-weight:500;color:var(--ink)}
-  .chop .proj{margin-top:8px;font-size:12.5px;color:var(--mute)}
 
   table{width:100%;border-collapse:collapse;font-size:14px}
   th{text-align:left;font-weight:500;font-size:12.5px;color:var(--mute);
@@ -1549,14 +1546,18 @@ function chopCard(l){
     ? `<span class="short">${pm.toFixed(2)}</span> behind ${pr.name} (${pr.proj.toFixed(2)})`
     : `<span class="${pm < 8 ? 'short' : 'long'}">+${pm.toFixed(2)}</span> over ${pr.name} (${pr.proj.toFixed(2)})`;
   const nb = [];
-  if (l.below) nb.push(`<span>below &nbsp;<b>${l.below.name}</b> <span class="num">${l.below.pts}</span></span>`);
-  if (l.above) nb.push(`<span>above &nbsp;<b>${l.above.name}</b> <span class="num">${l.above.pts}</span></span>`);
+  if (l.below) nb.push(`<span>↓ ${l.below.name} ${l.below.pts}</span>`);
+  if (l.above) nb.push(`<span>↑ ${l.above.name} ${l.above.pts}</span>`);
+  const mc = m <= 0 ? 'short' : (m < 8 ? 'warnc' : 'long');
   return `<div class="chop ${cls}" onclick="toggle('${l.league_id}')">
-    <div class="lg">${l.name}${l.best_ball ? ' &middot; best ball' : ''} &middot; proj <b>${l.proj_rank} of ${size}</b> <span style="opacity:.7">&middot; live ${l.rank}</span></div>
-    <div class="big num tick">${m > 0 ? '+' : ''}${m.toFixed(2)}<small>${verdict} &middot; you ${l.my_points.toFixed(2)}</small></div>
-    <div class="neighbors">${nb.join('')}</div>
-    <div class="proj num">proj final ${l.my_proj.toFixed(2)} &middot; ${projLine}</div>
-    <div class="proj num"><span class="${pctCls(l.survive_pct)}" style="font-size:15px">survive ${Math.round(l.survive_pct)}%</span> &middot; ${l.sens.toFixed(2)}%/pt &middot; you ${tp(l.my_to_play)} &middot; ${pr.name} ${tp(pr.to_play)}</div>
+    <div class="l1">
+      <span class="lg">${l.name}${l.best_ball ? ' <span class="pos">· best ball</span>' : ''} <span class="pos">· proj <b>${l.proj_rank} of ${size}</b> · live ${l.rank}</span></span>
+      <span class="num r1"><span class="big ${mc}">${m > 0 ? '+' : ''}${m.toFixed(2)}</span> <span class="pos">${verdict} · you ${l.my_points.toFixed(2)}</span></span>
+    </div>
+    <div class="l2 num pos">
+      <span><span class="${pctCls(l.survive_pct)}">survive ${Math.round(l.survive_pct)}%</span> · ${l.sens.toFixed(2)}%/pt · ${l.my_to_play[0]} v ${pr.to_play[0]} to play</span>
+      <span>${nb.join(' ')} · proj final ${l.my_proj.toFixed(2)} · ${projLine}</span>
+    </div>
   </div>${open.has(l.league_id) ? poolDetail(l) : ''}`;
 }
 
