@@ -356,7 +356,8 @@ def load_plays():
     return _plays_cache
 
 
-_INITIAL_LAST = re.compile(r"\b([A-Z])\.\s?([A-Z][A-Za-z'\-]+)")
+# 'J.Gibbs', and ESPN's two-letter disambiguation 'Mi.Wilson' / 'Ma.Wilson'.
+_INITIAL_LAST = re.compile(r"\b([A-Z][a-z]?)\.\s?([A-Z][A-Za-z'\-]+)")
 
 
 def build_feed(book, players=None):
@@ -366,11 +367,16 @@ def build_feed(book, players=None):
     from ESPN's participant list (full names), falling back to the
     'J.Gibbs' tokens in the play text matched by initial + surname + team.
     """
-    by_name, by_init = {}, {}
+    by_name, by_last = {}, {}
     for p in book:
         by_name[norm(p["name"])] = p
-        last = norm(p["name"].split()[-1]) if p["name"].split() else ""
-        by_init[(p["name"][:1].upper(), last, p["team"])] = p
+        parts = p["name"].split()
+        if parts:
+            by_last.setdefault((norm(parts[-1]), p["team"]), []).append(p)
+
+    def by_prefix(ini, last, team):
+        cands = [c for c in by_last.get((norm(last), team), []) if c["name"].lower().startswith(ini.lower())]
+        return cands[0] if len(cands) == 1 else None
     out = []
     for gid, g in load_plays().items():
         game_teams = set(g["teams"].values())
@@ -400,7 +406,7 @@ def build_feed(book, players=None):
                 tokens = _INITIAL_LAST.findall(text)
                 for i, (ini, last) in enumerate(tokens):
                     for t in game_teams:
-                        hit = by_init.get((ini, norm(last), t))
+                        hit = by_prefix(ini, last, t)
                         if hit:
                             hits[hit["id"]] = hit
                             if i == 0:
