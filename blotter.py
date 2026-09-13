@@ -358,9 +358,10 @@ def load_plays():
 _INITIAL_LAST = re.compile(r"\b([A-Z])\.\s?([A-Z][A-Za-z'\-]+)")
 
 
-def build_feed(book, players):
+def build_feed(book, players=None):
     """
-    Plays involving anyone in the book, newest first. Players are matched
+    Plays involving anyone in `book` (dicts with id/name/team/for/against/
+    pts), newest first. Players are matched
     from ESPN's participant list (full names), falling back to the
     'J.Gibbs' tokens in the play text matched by initial + surname + team.
     """
@@ -809,7 +810,12 @@ def shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats):
             "lineup": lineup_rows(det, players, stats),
             "ref_lineup": lineup_rows(proj_by_rid[pref["rid"]][2], players, stats),
         })
-    return {"teams": teams}
+    roster = {}
+    for t in teams:
+        for r in t["lineup"]:
+            roster.setdefault(r["pid"], {"id": r["pid"], "name": r["name"], "team": r["team"],
+                                         "pts": r["act"], "for": [], "against": []})
+    return {"teams": teams, "feed": build_feed(list(roster.values()))}
 
 
 # ----------------------------------------------------------------------------
@@ -1138,7 +1144,7 @@ def api_league(lid):
     if not lg:
         return jsonify({"error": "league not found"}), 404
     return jsonify({"week": data["week"], "updated": data["updated"], "stale": data.get("stale"),
-                    "name": lg["name"], "teams": lg["shared"]["teams"]})
+                    "name": lg["name"], "teams": lg["shared"]["teams"], "feed": lg["shared"]["feed"]})
 
 
 @app.route("/l/<lid>")
@@ -1437,6 +1443,12 @@ function leagueTick(d){
   if (me){
     open.add(me.league_id);              // field + lineups always shown here
     html += chopCard(me);
+    const mine = new Set(me.lineup.map(r => r.pid)), theirs = new Set((me.ref_lineup || []).map(r => r.pid));
+    const feed = (d.feed || []).map(e => ({...e, players: e.players
+        .filter(p => mine.has(p.id) || theirs.has(p.id))
+        .map(p => ({...p, for: mine.has(p.id) ? ['you'] : [], against: theirs.has(p.id) ? [me.proj_ref.name] : []}))}))
+      .filter(e => e.players.length);
+    html += section('feed', 'Feed', feedRows(feed), feed.length);
   } else {
     html += `<div class="pos" style="margin:12px 0 20px">Pick your team to see your margin, survival odds and lineup.</div>`;
   }
