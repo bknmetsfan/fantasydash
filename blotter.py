@@ -925,6 +925,10 @@ def build():
             "lineup": lineup_rows(my_det, players, stats),
             "_log": [r for rid, (_, _, det) in proj_by_rid.items()
                      for r in log_rows(rid, rid == my_rid, det, players)],
+            # Best ball: the rest of the roster can still play its way into
+            # the lineup, so the feed watches them too (tagged bench).
+            "bench": [{"id": p, "pts": round((my_m.get("players_points") or {}).get(p) or 0.0, 2)}
+                      for p in (my_m.get("players") or []) if best_ball and p not in my_lineup],
             "starters": my_lineup,
             "starters_proj": my_proj,
             "starters_points": my_m.get("starters_points") or [],
@@ -1091,7 +1095,17 @@ def build():
     # Sort by what is still at stake tonight, then by how much each point matters.
     book.sort(key=lambda x: (-abs(x["impact"]), -abs(x["root"])))
 
-    feed = build_feed(book, players)
+    watch = {p["id"]: dict(p) for p in book}
+    for lg in out_leagues:
+        for b in lg.get("bench", []):
+            tag = f"{lg['name'][:14]} (bench)"
+            if b["id"] in watch:
+                watch[b["id"]] = {**watch[b["id"]], "for": watch[b["id"]]["for"] + [tag]}
+            else:
+                pl = players.get(b["id"], {})
+                watch[b["id"]] = {"id": b["id"], "name": pl.get("name", b["id"]), "team": pl.get("team", ""),
+                                  "pts": b["pts"], "for": [tag], "against": []}
+    feed = build_feed(list(watch.values()), players)
     log_snapshot(CONFIG["season"], week, out_leagues)   # pops the _log rows
     for lg in out_leagues:
         lg.pop("_log", None)
