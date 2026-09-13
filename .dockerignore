@@ -1,0 +1,8 @@
+.venv
+.claude
+espn.json
+espn.example.json
+blotter.sqlite
+players_nfl.json
+__pycache__
+*.pyc

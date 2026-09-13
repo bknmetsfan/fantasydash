@@ -1,0 +1,8 @@
+{
+  "_how": "Log in at espn.com, open DevTools > Application > Cookies > https://www.espn.com. Copy espn_s2 (long string) and SWID (keep the braces). league_id is the number in your league URL (leagueId=...). Save this file as espn.json.",
+  "espn_s2": "PASTE_ESPN_S2_HERE",
+  "swid": "{PASTE-SWID-HERE}",
+  "leagues": [
+    {"league_id": 123456, "name": "optional display name", "team_id": null}
+  ]
+}

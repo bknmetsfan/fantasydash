@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "blotter",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["blotter.py"],
+      "env": {"PORT": "5050"},
+      "port": 5050
+    }
+  ]
+}

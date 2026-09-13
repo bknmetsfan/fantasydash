@@ -1,0 +1,22 @@
+[
+  {
+    "name": "Eliminator.gg",
+    "scoring": "eliminator",
+    "starters": [
+      "Jalen Hurts",
+      "Jonathan Taylor",
+      "Saquon Barkley",
+      "Jaylen Waddle",
+      "CeeDee Lamb",
+      {
+        "name": "Nico Collins",
+        "mult": 1.5
+      },
+      "Dallas Goedert",
+      {
+        "name": "Jahmyr Gibbs",
+        "mult": 1.5
+      }
+    ]
+  }
+]

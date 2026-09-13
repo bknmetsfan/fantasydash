@@ -1,0 +1,10 @@
+# secrets
+espn.json
+# local runtime state
+.venv/
+blotter.sqlite
+players_nfl.json
+__pycache__/
+*.pyc
+.claude/settings.local.json
+.DS_Store
