@@ -307,8 +307,9 @@ ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
 ESPN_UA = {"User-Agent": "curl/8.0"}          # Akamai rejects fake browser UAs here
 FEED_SKIP_TYPES = {"Kickoff", "Pass Incompletion", "Sack", "Penalty", "Punt", "Kneel", "Spike",
                    "Official Timeout", "Coin Toss"}
-PLAY_ROLES = {"passer", "rusher", "receiver", "kicker", "returner", "scorer", "fumbler",
-              "puntReturner", "kickReturner", "interceptedBy", "recoveredBy"}
+PLAY_ROLES = {"passer": "pass", "rusher": "rush", "receiver": "rec", "kicker": "kick",
+              "returner": "ret", "scorer": "score", "fumbler": "fum", "puntReturner": "ret",
+              "kickReturner": "ret", "interceptedBy": "int", "recoveredBy": "rec fum"}
 
 
 def load_plays():
@@ -386,18 +387,26 @@ def build_feed(book, players=None):
                 or "penalty" in ptype.lower()
             ):
                 continue
-            hits = {}
+            hits, roles = {}, {}
             for part in pl.get("participants") or []:
                 if part.get("type") in PLAY_ROLES:
                     hit = by_name.get(norm(part.get("athlete", {}).get("displayName", "")))
                     if hit:
                         hits[hit["id"]] = hit
+                        roles.setdefault(hit["id"], PLAY_ROLES[part["type"]])
             if not hits:
-                for ini, last in _INITIAL_LAST.findall(text):
+                # No participant list: read 'J.Love pass ... to C.Watson' style text.
+                # First name token is the passer/rusher, the one after 'to' the receiver.
+                tokens = _INITIAL_LAST.findall(text)
+                for i, (ini, last) in enumerate(tokens):
                     for t in game_teams:
                         hit = by_init.get((ini, norm(last), t))
                         if hit:
                             hits[hit["id"]] = hit
+                            if i == 0:
+                                roles.setdefault(hit["id"], "pass" if " pass " in text else "rush")
+                            elif f"to {ini}.{last}" in text:
+                                roles.setdefault(hit["id"], "rec")
             if not hits:
                 continue
             try:
@@ -414,7 +423,7 @@ def build_feed(book, players=None):
                 "text": re.sub(r"^\((?:Shotgun|No Huddle|No Huddle, Shotgun)\)\s*", "", text),
                 "scoring": bool(pl.get("scoringPlay")),
                 "players": [{"id": h["id"], "name": h["name"], "for": h["for"], "against": h["against"],
-                             "pts": h["pts"]} for h in hits.values()],
+                             "pts": h["pts"], "role": roles.get(h["id"], "")} for h in hits.values()],
             })
     out.sort(key=lambda e: -e["ts"])
     return out[:FEED_MAX]
@@ -1399,7 +1408,7 @@ function feedRows(feed){
   const rows = shown.map(e => {
     const fors = [...new Set(e.players.flatMap(p => p.for))].join(', ');
     const agst = [...new Set(e.players.flatMap(p => p.against))].join(', ');
-    const who = e.players.map(p => `<b>${p.name}</b>${p.pts != null ? ` <span class="num pos">${p.pts.toFixed(1)}</span>` : ''}`).join(', ');
+    const who = e.players.map(p => `<b>${p.name}</b>${p.role ? ` <span class="pos">(${p.role})</span>` : ''}${p.pts != null ? ` <span class="num pos">${p.pts.toFixed(1)}</span>` : ''}`).join('<br>');
     return `<div class="fev ${e.scoring ? 'score' : ''}">
       <span class="num pos ft">${e.t}<br><span style="font-size:11px">${e.q} ${e.clock}</span></span>
       <span class="fname">${who}<br><span class="pos" style="font-size:12px">${e.game}</span></span>
