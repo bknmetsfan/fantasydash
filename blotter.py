@@ -1198,11 +1198,12 @@ PAGE = r"""<!doctype html>
   .detail table.lineup td{white-space:nowrap}
   .detail table.lineup td:nth-child(3){white-space:normal;font-size:12px;min-width:160px}
   .detail h3 .num{color:var(--ink)}
-  .fev{display:grid;grid-template-columns:44px 1fr 52px 2fr 56px 1.4fr;gap:10px;align-items:baseline;
+  .fev{display:grid;grid-template-columns:44px 1fr 52px 2fr 1.2fr 1.2fr;gap:10px;align-items:baseline;
        padding:5px 0;border-bottom:1px solid var(--rule);font-size:13.5px}
   .fev.minor{opacity:.65}
   .fev.fhead{font-size:12px;color:var(--mute);font-weight:500}
-  .fev .fd,.fev .fs{text-align:right}
+  .fev .fd{text-align:right}
+  .fev .tags{padding-left:0;font-weight:400}
   .fev .fwhat{font-size:12.5px}
   .pick{margin:0 0 18px;font-size:13px;color:var(--mute)}
   .pick select{font:inherit;padding:4px 8px;border:1px solid var(--rule);background:var(--panel);color:var(--ink)}
@@ -1356,19 +1357,16 @@ function feedRows(feed){
   if (!feed || !feed.length) return '<div class="pos" style="padding:6px 0 10px">Nothing yet — events appear as your players score.</div>';
   const shown = showMinor ? feed : feed.filter(e => !e.minor);
   const sgn = x => x > 0 ? 'long' : (x < 0 ? 'short' : 'pos');
-  const rows = shown.slice(0, 40).map(e => {
-    const tags = [...e.for, ...e.against.map(x => '¬' + x)].join(', ');
-    return `<div class="fev ${e.minor ? 'minor' : ''}">
+  const rows = shown.slice(0, 40).map(e => `<div class="fev ${e.minor ? 'minor' : ''}">
       <span class="num pos ft">${e.t}</span>
       <span class="fname">${e.name} <span class="pos">${e.pos} ${e.team}</span></span>
       <span class="num fd ${sgn(e.delta)}">${e.delta > 0 ? '+' : ''}${e.delta.toFixed(1)}</span>
       <span class="fwhat pos">${e.what || '—'}</span>
-      <span class="num fs ${sgn(e.swing)}" title="swing in your odds, pp">${e.swing ? (e.swing > 0 ? '+' : '') + e.swing.toFixed(1) + '%' : ''}</span>
-      <span class="tags">${tags}</span>
-    </div>`;
-  }).join('');
+      <span class="tags long">${e.for.join(', ')}</span>
+      <span class="tags short">${e.against.join(', ')}</span>
+    </div>`).join('');
   const hidden = feed.length - shown.length;
-  const head = `<div class="fev fhead"><span></span><span>Player</span><span class="fd">Pts</span><span>What happened</span><span class="fs" title="points x root/pt: change in your survival/win odds">Odds</span><span>Leagues</span></div>`;
+  const head = `<div class="fev fhead"><span></span><span>Player</span><span class="fd">Pts</span><span>What happened</span><span>Yours in</span><span>Against in</span></div>`;
   return head + rows + `<div class="pos" style="font-size:12px;margin-top:6px"><a href="#" onclick="showMinor=!showMinor;tick();return false">${showMinor ? 'hide' : 'show'} minor ticks${hidden ? ` (${hidden})` : ''}</a></div>`;
 }
 
