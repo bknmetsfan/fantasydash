@@ -323,6 +323,9 @@ def load_plays():
         sb = requests.get(f"{ESPN_SITE}/scoreboard", headers=ESPN_UA, timeout=10).json()
     except Exception:
         return _plays_cache
+    current = {ev["id"] for ev in sb.get("events", [])}
+    for gid in [g for g in _plays_cache if g not in current]:
+        del _plays_cache[gid]            # last week's games
     for ev in sb.get("events", []):
         gid = ev["id"]
         state = ev["status"]["type"]["state"]
@@ -439,6 +442,11 @@ def win_pct(a, b):
     return round(100 * float(np.mean(a > b) + 0.5 * np.mean(a == b)), 1)
 
 
+def my_rid_missing(mine, by_roster):
+    """True once we've been chopped (or otherwise have no live matchup)."""
+    return mine["roster_id"] not in by_roster
+
+
 def chop_line(sorted_field, idx, key):
     """
     Distance to the chop line, signed. Positive: your cushion over the
@@ -515,7 +523,7 @@ def manual_score(stats, scoring):
     return stats.get("pts_" + scoring) or 0.0
 
 
-def load_manual(players, projections, stats, games):
+def load_manual(players, projections, stats, games, week):
     """
     manual.json format:
       [{"name": "Eliminator.gg", "scoring": "eliminator",
@@ -534,6 +542,7 @@ def load_manual(players, projections, stats, games):
     out = []
     for team in json.loads(MANUAL_FILE.read_text()):
         scoring = team.get("scoring", "ppr")
+        stale = team.get("week") is not None and team.get("week") != week
         resolved, missed, mults = [], [], {}
         for raw in team.get("starters", []):
             name, mult = (raw["name"], raw.get("mult", 1)) if isinstance(raw, dict) else (raw, 1)
@@ -558,6 +567,7 @@ def load_manual(players, projections, stats, games):
             "mode": "manual",
             "starters": resolved,
             "unmatched": missed,
+            "stale_week": team.get("week") if stale else None,
             "my_points": round(sum(actual.values()), 2),
             "my_proj": round(sum(proj.values()), 2),
             "my_to_play": to_play(det),
@@ -677,8 +687,11 @@ def load_espn(week, players, games, stats):
                         espn_s2=cfg.get("espn_s2"), swid=cfg.get("swid"))
             boxes = lg.box_scores(week)
         except Exception as exc:
+            msg = str(exc)
+            if "credentials" in msg.lower() or "401" in msg or "403" in msg:
+                msg += " — the espn_s2 cookie has probably expired: re-copy it from a logged-in espn.com session and run `fly secrets set ESPN_S2=...`"
             out.append({"league_id": lid, "name": lc.get("name") or f"ESPN {lc['league_id']}",
-                        "mode": "error", "error": str(exc)})
+                        "mode": "error", "error": msg})
             continue
 
         # Whole-league context first, so the drill-down works even for a
@@ -873,11 +886,20 @@ def build():
 
         rosters = get(f"/league/{lid}/rosters")
         users = {u["user_id"]: (u.get("display_name") or "?") for u in get(f"/league/{lid}/users")}
-        matchups = get(f"/league/{lid}/matchups/{week}")
+        matchups = get(f"/league/{lid}/matchups/{week}") or []
+        # Eliminated guillotine rosters linger in the matchup list with no
+        # players and no lineup; they'd otherwise sit at the bottom of the
+        # field forever. Also covers the Tue/Wed gap before Sleeper builds
+        # the new week (no matchups at all -> skip the league this refresh).
+        roster_players = {r["roster_id"]: r.get("players") or [] for r in rosters}
+        matchups = [m for m in matchups
+                    if roster_players.get(m["roster_id"]) or any(p and p != "0" for p in (m.get("starters") or []))]
+        if not matchups:
+            continue
         by_roster = {m["roster_id"]: m for m in matchups}
 
         mine = next((r for r in rosters if r.get("owner_id") == uid), None)
-        if mine is None:
+        if mine is None or my_rid_missing(mine, by_roster):
             continue
         my_rid = mine["roster_id"]
         my_m = by_roster.get(my_rid, {})
@@ -1067,7 +1089,7 @@ def build():
         out_leagues.append(entry)
 
     # Manual teams join the exposure book but have no live scoring of their own.
-    out_leagues.extend(load_manual(players, projections, stats, games))
+    out_leagues.extend(load_manual(players, projections, stats, games, week))
 
     espn_leagues, extras = load_espn(week, players, games, stats)
     out_leagues.extend(espn_leagues)
@@ -1551,6 +1573,7 @@ async function tick(){
   if (manual.length){
     const bad = manual.flatMap(m => m.unmatched);
     if (bad.length) html += `<div class="err">Unmatched names in manual.json: ${bad.join(', ')}. Fix the spelling to fold them into exposure.</div>`;
+    manual.filter(m => m.stale_week).forEach(m => { html = `<div class="err">${m.name}: manual.json is still the week ${m.stale_week} lineup — it's week ${d.week}. Update starters + multipliers and redeploy.</div>` + html; });
   }
   $('#app').innerHTML = html;
   $('#meta').textContent = `wk ${d.week} · ${d.updated}` + (d.stale ? ' · stale' : '');
