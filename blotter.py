@@ -630,6 +630,18 @@ def load_espn(week, players, games, stats):
 
     slot_order = ["QB", "RB", "WR", "TE", "RB/WR", "WR/TE", "RB/WR/TE", "OP", "D/ST", "K"]
 
+    def bench_rows(lineup):
+        det = {}
+        for bp in lineup:
+            if bp.slot_position not in ("BE", "IR"):
+                continue
+            pid = resolve(bp)
+            team = pid if pid in games else players.get(pid, extras.get(pid, {})).get("team")
+            det[pid] = {"act": bp.points or 0.0, "proj": bp.projected_points or 0.0,
+                        "rem": games.get(team, 1.0), "pos": "DEF" if bp.position == "D/ST" else bp.position}
+        det = dict(sorted(det.items(), key=lambda kv: -(kv[1]["act"] + kv[1]["proj"] * kv[1]["rem"])))
+        return lineup_rows(det, {**players, **extras}, stats)
+
     def side(lineup):
         # ESPN returns roster entries in no useful order; present them by slot.
         starters = sorted((bp for bp in lineup if bp.slot_position not in ("BE", "IR")),
@@ -710,6 +722,7 @@ def load_espn(week, players, games, stats):
                     "my_proj": round(sum(my_proj.values()), 2),
                     "my_to_play": to_play(my_det),
                     "lineup": lineup_rows(my_det, {**players, **extras}, stats),
+                    "bench_lineup": bench_rows(getattr(box, f"{me}_lineup")),
                     "_log": [r for rid, d in sides.items()
                              for r in log_rows(rid, rid == team.team_id, d[3], {**players, **extras})],
                     "starters": my_ids, "starters_proj": my_proj,
@@ -900,6 +913,18 @@ def build():
                           "rem": games.get(team, 1.0), "pos": players.get(p, {}).get("pos", "")}
             return ids, {p: val(p) for p in ids}, det
 
+        def bench_det(m, lineup_ids):
+            actual = m.get("players_points") or {}
+            det = {}
+            for p in m.get("players") or []:
+                if p in lineup_ids or not p or p == "0":
+                    continue
+                team = p if p in games else players.get(p, {}).get("team")
+                det[p] = {"act": actual.get(p) or 0.0, "proj": proj_pts(p, projections, scoring) or 0.0,
+                          "rem": games.get(team, 1.0), "pos": players.get(p, {}).get("pos", "")}
+            # Highest projected first so the "should have started him" case is on top.
+            return dict(sorted(det.items(), key=lambda kv: -(kv[1]["act"] + kv[1]["proj"] * kv[1]["rem"])))
+
         proj_by_rid = {m["roster_id"]: lineup(m) for m in matchups}
         sims = simulate({rid: det for rid, (_, _, det) in proj_by_rid.items()}, CONFIG["sims"])
         field = sorted(
@@ -929,6 +954,7 @@ def build():
             # the lineup, so the feed watches them too (tagged bench).
             "bench": [{"id": p, "pts": round((my_m.get("players_points") or {}).get(p) or 0.0, 2)}
                       for p in (my_m.get("players") or []) if best_ball and p not in my_lineup],
+            "bench_lineup": lineup_rows(bench_det(my_m, my_lineup), players, stats),
             "starters": my_lineup,
             "starters_proj": my_proj,
             "starters_points": my_m.get("starters_points") or [],
@@ -1314,6 +1340,14 @@ function lineupTable(title, rows){
     </table>`;
 }
 
+function benchBlock(l){
+  const rows = l.bench_lineup || [];
+  if (!rows.length) return '';
+  const key = 'bench:' + l.league_id, isOpen = open.has(key);
+  return `<h3 class="bench" onclick="event.stopPropagation();toggle('${key}')" style="cursor:pointer">Bench <span class="cnt">${rows.length}</span> · <span style="text-decoration:underline">${isOpen ? 'hide' : 'show'}</span></h3>
+    ${isOpen ? lineupTable('Bench', rows).replace(/<h3>.*?<\/h3>/, '') : ''}`;
+}
+
 function poolDetail(l){
   // Field sorted by projected final, high -> low: the projected chop is the
   // last row, line drawn above it. Live rank alongside in grey (l.field is
@@ -1333,6 +1367,7 @@ function poolDetail(l){
       <td class="r num pos">${lrank[t.rid]}</td></tr>`).join('')}
     </table>
     ${lineupTable('Your lineup', l.lineup)}
+    ${benchBlock(l)}
     ${lineupTable(`${l.proj_ref.name}`, l.ref_lineup)}
     </div>`;
 }
@@ -1350,6 +1385,7 @@ function h2hDetail(l){
   };
   return `<div class="detail">
     ${lineupTable('Your lineup', l.lineup)}
+    ${benchBlock(l)}
     ${lineupTable(l.opp_name ?? 'Opponent', l.opp_lineup)}
     <h3>This week · pts, proj final · win % for the left team</h3>
     <table>${(l.matchups || []).map(p => p.length === 2 ? row(p[0], p[1]) : '').join('')}</table>
