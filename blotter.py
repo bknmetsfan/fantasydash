@@ -479,16 +479,28 @@ def build_feed(book, players=None, scoring_by_tag=None):
             if not hits:
                 # No participant list: read 'J.Love pass ... to C.Watson' style text.
                 # First name token is the passer/rusher, the one after 'to' the receiver.
-                tokens = _INITIAL_LAST.findall(text)
-                for i, (ini, last) in enumerate(tokens):
+                for mt in _INITIAL_LAST.finditer(text):
+                    ini, last = mt.groups()
                     for t in game_teams:
                         hit = by_prefix(ini, last, t)
-                        if hit:
-                            hits[hit["id"]] = hit
-                            if i == 0:
-                                roles.setdefault(hit["id"], "pass" if " pass " in text else "rush")
-                            elif f"to {ini}.{last}" in text:
-                                roles.setdefault(hit["id"], "rec")
+                        if not hit:
+                            continue
+                        hits[hit["id"]] = hit
+                        # Role from the words around the name, not its position:
+                        # pre-snap notes ("A.Belton reported in as eligible.") come first.
+                        before = text[max(0, mt.start() - 14):mt.start()].lower()
+                        after = text[mt.end():mt.end() + 24].lower()
+                        if after.startswith(" pass") or after.startswith(" scrambles") or after.startswith(" sacked"):
+                            role = "rush" if after.startswith(" scrambles") else "pass"
+                        elif before.endswith("to ") or before.endswith("for ") or " to " in before[-4:]:
+                            role = "rec"
+                        elif after.startswith(" kicks") or "field goal" in after or "extra point" in after:
+                            role = "kick"
+                        elif after.startswith(" fumbles"):
+                            role = "fum"
+                        else:
+                            role = "rush"
+                        roles.setdefault(hit["id"], role)
             if not hits:
                 continue
             try:
