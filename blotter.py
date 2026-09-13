@@ -38,6 +38,9 @@ CONFIG = {
     "exclude_leagues": [],
     "sims": 5000,                # Monte Carlo draws per league
     "log_seconds": 60,           # min gap between calibration snapshots (0 = off)
+    # Guillotine leagues whose /l/<id> page is open (no password) so
+    # leaguemates can pick their own team and see the chop picture.
+    "shared_leagues": ["1400335104223485952"],   # Paris in 1795v2
     # How much you care, per league id (default 1.0). Scales the rooting
     # interest of every player in that league. Rebuilding dynasty teams are
     # "my guys, but not this year".
@@ -656,6 +659,40 @@ def log_rows(rid, mine, det, players):
             for pid, d in det.items()]
 
 
+def shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats):
+    """
+    Every team's seat in a guillotine league, each shaped like our own pool
+    entry so the page can reuse chopCard/poolDetail unchanged.
+    """
+    n = len(field)
+    live_order = [f["rid"] for f in field]
+    proj_order = [f["rid"] for f in pfield]
+    teams = []
+    for f in field:
+        rid = f["rid"]
+        li, pi = live_order.index(rid), proj_order.index(rid)
+        margin, ref = chop_line(field, li, "pts")
+        pmargin, pref = chop_line(pfield, pi, "proj")
+        others = [sims[x] for x in live_order if x != rid]
+        _, _, det = proj_by_rid[rid]
+        teams.append({
+            "league_id": entry["league_id"], "name": entry["name"], "mode": "pool",
+            "best_ball": entry["best_ball"], "week": entry["week"],
+            "rid": rid, "team": f["name"], "my_rid": rid,
+            "my_points": f["pts"], "my_proj": f["proj"], "my_to_play": f["to_play"],
+            "field": field, "field_size": n,
+            "rank": n - li, "margin": margin, "ref": ref,
+            "below": field[li - 1] if li > 0 else None,
+            "above": field[li + 1] if li + 1 < n else None,
+            "proj_rank": n - pi, "proj_margin": pmargin, "proj_ref": pref,
+            "survive_pct": round(100 - f["chop_pct"], 1),
+            "sens": point_value(sims[rid], np.min(others, axis=0)),
+            "lineup": lineup_rows(det, players, stats),
+            "ref_lineup": lineup_rows(proj_by_rid[pref["rid"]][2], players, stats),
+        })
+    return {"teams": teams}
+
+
 # ----------------------------------------------------------------------------
 # Build the picture
 # ----------------------------------------------------------------------------
@@ -793,6 +830,9 @@ def build():
                 "survive_pct": round(100 - field[rank]["chop_pct"], 1),
                 "ref_lineup": lineup_rows(proj_by_rid[pref["rid"]][2], players, stats),
             })
+            if lid in CONFIG["shared_leagues"]:
+                entry["shared"] = shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats)
+
             others = {f["rid"]: sims[f["rid"]] for f in field if f["rid"] != my_rid}
             entry["sens"] = point_value(sims[my_rid], np.min(list(others.values()), axis=0))
             # The nearest rival's starters count against you, scaled by how
@@ -929,7 +969,7 @@ def build():
 def basic_auth():
     """Single shared password via BLOTTER_PASSWORD; open when unset (local)."""
     pw = os.environ.get("BLOTTER_PASSWORD")
-    if not pw or request.path == "/healthz":
+    if not pw or request.path == "/healthz" or request.path.startswith(("/l/", "/api/league/")):
         return None
     auth = request.headers.get("Authorization", "")
     ok = False
@@ -943,8 +983,8 @@ def basic_auth():
         return Response("auth required", 401, {"WWW-Authenticate": 'Basic realm="blotter"'})
 
 
-@app.route("/api/state")
-def api_state():
+def current_state():
+    """Cached build, refreshed at most every poll_seconds. Returns (data, error)."""
     with _build_lock:
         now = time.time()
         if _cache["data"] is None or now - _cache["ts"] > CONFIG["poll_seconds"]:
@@ -953,9 +993,40 @@ def api_state():
                 _cache["ts"] = now
             except Exception as exc:
                 if _cache["data"] is None:
-                    return jsonify({"error": str(exc)}), 502
+                    return None, str(exc)
                 _cache["data"]["stale"] = str(exc)
-        return jsonify(_cache["data"])
+        return _cache["data"], None
+
+
+@app.route("/api/state")
+def api_state():
+    data, err = current_state()
+    if err:
+        return jsonify({"error": err}), 502
+    return jsonify(data)
+
+
+@app.route("/api/league/<lid>")
+def api_league(lid):
+    """Public per-team view of a shared guillotine league."""
+    if lid not in CONFIG["shared_leagues"]:
+        return jsonify({"error": "not shared"}), 404
+    data, err = current_state()
+    if err:
+        return jsonify({"error": err}), 502
+    lg = next((l for l in data["leagues"] if l["league_id"] == lid and l.get("shared")), None)
+    if not lg:
+        return jsonify({"error": "league not found"}), 404
+    return jsonify({"week": data["week"], "updated": data["updated"], "stale": data.get("stale"),
+                    "name": lg["name"], "teams": lg["shared"]["teams"]})
+
+
+@app.route("/l/<lid>")
+def league_page(lid):
+    if lid not in CONFIG["shared_leagues"]:
+        return Response("not shared", 404)
+    return Response(PAGE.replace("<script>", f"<script>const LEAGUE_ID = {json.dumps(lid)};", 1),
+                    mimetype="text/html")
 
 
 @app.route("/healthz")
@@ -1035,17 +1106,20 @@ PAGE = r"""<!doctype html>
   .detail table.lineup td{white-space:nowrap}
   .detail table.lineup td:nth-child(3){white-space:normal;font-size:12px;min-width:160px}
   .detail h3 .num{color:var(--ink)}
+  .pick{margin:0 0 18px;font-size:13px;color:var(--mute)}
+  .pick select{font:inherit;padding:4px 8px;border:1px solid var(--rule);background:var(--panel);color:var(--ink)}
   @media (prefers-reduced-motion:no-preference){
     .tick{transition:color .4s ease}
   }
 </style>
 <header>
-  <h1>Sunday blotter</h1>
+  <h1 id="h1">Sunday blotter</h1>
   <div class="meta num" id="meta">loading</div>
 </header>
 <div id="app"></div>
 <script>
 const $ = s => document.querySelector(s);
+if (typeof LEAGUE_ID === 'undefined') window.LEAGUE_ID = null;
 const open = new Set();   // league ids with the drill-down expanded; survives re-render
 function toggle(id){ open.has(id) ? open.delete(id) : open.add(id); tick(); }
 const f2 = x => (x ?? 0).toFixed(2);
@@ -1185,11 +1259,40 @@ function bookRows(book){
   }).join('');
 }
 
+function leagueTick(d){
+  // Leaguemate view: pick a team, see the chop picture from that seat.
+  const key = 'team:' + LEAGUE_ID;
+  const fromUrl = new URLSearchParams(location.search).get('team');
+  let rid = fromUrl || (() => { try { return localStorage.getItem(key); } catch(e){ return null; } })();
+  let me = d.teams.find(t => String(t.rid) === String(rid));
+  const picker = `<div class="pick"><label>Your team &nbsp;<select id="team" onchange="pickTeam(this.value)">
+    <option value="">— choose —</option>
+    ${[...d.teams].sort((a,b) => a.team.localeCompare(b.team)).map(t => `<option value="${t.rid}" ${me && t.rid === me.rid ? 'selected' : ''}>${t.team}</option>`).join('')}
+  </select></label></div>`;
+  let html = picker;
+  if (me){
+    open.add(me.league_id);              // field + lineups always shown here
+    html += chopCard(me);
+  } else {
+    html += `<div class="pos" style="margin:12px 0 20px">Pick your team to see your margin, survival odds and lineup.</div>`;
+  }
+  $('#app').innerHTML = html;
+  $('#h1').textContent = d.name;
+  $('#meta').textContent = `wk ${d.week} · ${d.updated}` + (d.stale ? ' · stale' : '');
+}
+function pickTeam(rid){
+  try { localStorage.setItem('team:' + LEAGUE_ID, rid); } catch(e){}
+  history.replaceState(null, '', rid ? `?team=${rid}` : location.pathname);
+  tick();
+}
+
 async function tick(){
   let d;
-  try { d = await (await fetch('/api/state')).json(); }
+  const url = LEAGUE_ID ? `/api/league/${LEAGUE_ID}` : '/api/state';
+  try { d = await (await fetch(url)).json(); }
   catch(e){ $('#meta').textContent = 'offline'; return; }
   if (d.error){ $('#app').innerHTML = `<div class="err">${d.error}</div>`; return; }
+  if (LEAGUE_ID) return leagueTick(d);
 
   const pools = d.leagues.filter(l => l.mode === 'pool').sort((a,b) => a.survive_pct - b.survive_pct);
   const h2h   = d.leagues.filter(l => l.mode === 'h2h');
