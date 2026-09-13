@@ -69,6 +69,7 @@ _log_last = {"ts": 0.0}
 OT_TEAMS = set()          # teams currently in overtime, for the "left" column
 _feed = {"prev": None, "events": []}   # last book keyed by pid, and the rolling scoring feed
 FEED_MAX = 150
+FEED_MERGE_S = 90         # follow-up ticks for the same player fold into one event
 
 
 # ----------------------------------------------------------------------------
@@ -125,9 +126,10 @@ def load_projections(season, week):
 
 def load_stats(season, week):
     """Live actual stat lines for every player who has recorded one this week,
-    with Sleeper's pts_ppr / pts_half_ppr / pts_std precomputed. Cached 60s."""
+    with Sleeper's pts_ppr / pts_half_ppr / pts_std precomputed. Cached for
+    one poll so the feed sees stat lines move with the points."""
     key = (season, week)
-    if _stats_cache["key"] == key and time.time() - _stats_cache["ts"] < 60:
+    if _stats_cache["key"] == key and time.time() - _stats_cache["ts"] < CONFIG["poll_seconds"]:
         return _stats_cache["data"]
     qs = "&".join(f"position[]={p}" for p in ("QB", "RB", "WR", "TE", "K", "DEF"))
     rows = get(f"/{season}/{week}?season_type=regular&{qs}", base="https://api.sleeper.com/stats/nfl")
@@ -350,26 +352,36 @@ def update_feed(book, stats):
     """
     prev = _feed["prev"] or {}
     now = time.strftime("%H:%M")
+    ts = time.time()
+    events = _feed["events"]
     new_events = []
     for p in book:
         pid = p["id"]
         old = prev.get(pid)
+        cur_stats = stats.get(pid) or {}
         if old is None or p["pts"] is None:
             continue
-        delta = round(p["pts"] - (old["pts"] or 0.0), 2)
-        if abs(delta) < 0.05:
+        pts_moved = abs(p["pts"] - (old["pts"] or 0.0)) >= 0.05
+        stats_moved = cur_stats != (old["stats"] or {})
+        if not (pts_moved or stats_moved):
             continue
-        what = describe_delta(stats.get(pid) or {}, old["stats"] or {})
-        new_events.append({
-            "t": now, "ts": time.time(), "pid": pid, "name": p["name"], "pos": p["pos"], "team": p["team"],
-            "delta": delta, "pts": p["pts"], "what": what,
-            "for": p["for"], "against": p["against"],
-            "swing": round(delta * p["root"], 1),
-            "minor": abs(delta) < 1.5 and "TD" not in what and "INT" not in what and "fumble" not in what,
-        })
-    # Biggest swings first within the same tick, then newest overall.
+        # Same player within the merge window: extend the existing event so a
+        # drive reads as one line and the stat line can catch up with the points.
+        ev = next((e for e in events if e["pid"] == pid and ts - e["ts"] < FEED_MERGE_S), None)
+        if ev is None:
+            ev = {"t": now, "ts": ts, "pid": pid, "name": p["name"], "pos": p["pos"], "team": p["team"],
+                  "base_pts": old["pts"] or 0.0, "base_stats": dict(old["stats"] or {}),
+                  "for": p["for"], "against": p["against"]}
+            new_events.append(ev)
+        ev["ts"] = ts
+        ev["delta"] = round(p["pts"] - ev["base_pts"], 2)
+        ev["pts"] = p["pts"]
+        ev["what"] = describe_delta(cur_stats, ev["base_stats"])
+        ev["swing"] = round(ev["delta"] * p["root"], 1)
+        ev["minor"] = abs(ev["delta"]) < 1.5 and not any(k in ev["what"] for k in ("TD", "INT", "fumble", "takeaway"))
     new_events.sort(key=lambda e: -abs(e["swing"]))
-    _feed["events"] = (new_events + _feed["events"])[:FEED_MAX]
+    events = [e for e in new_events + events if abs(e["delta"]) >= 0.05 or e["what"]]
+    _feed["events"] = events[:FEED_MAX]
     _feed["prev"] = {p["id"]: {"pts": p["pts"], "stats": dict(stats.get(p["id"]) or {})} for p in book}
     return _feed["events"]
 
@@ -1031,7 +1043,7 @@ def build():
     # Sort by what is still at stake tonight, then by how much each point matters.
     book.sort(key=lambda x: (-abs(x["impact"]), -abs(x["root"])))
 
-    feed = update_feed(book, stats)
+    feed = [{k: v for k, v in e.items() if not k.startswith("base_")} for e in update_feed(book, stats)]
     log_snapshot(CONFIG["season"], week, out_leagues)   # pops the _log rows
     for lg in out_leagues:
         lg.pop("_log", None)
@@ -1189,6 +1201,7 @@ PAGE = r"""<!doctype html>
   .fev{display:grid;grid-template-columns:44px 1fr 52px 2fr 56px 1.4fr;gap:10px;align-items:baseline;
        padding:5px 0;border-bottom:1px solid var(--rule);font-size:13.5px}
   .fev.minor{opacity:.65}
+  .fev.fhead{font-size:12px;color:var(--mute);font-weight:500}
   .fev .fd,.fev .fs{text-align:right}
   .fev .fwhat{font-size:12.5px}
   .pick{margin:0 0 18px;font-size:13px;color:var(--mute)}
@@ -1355,7 +1368,8 @@ function feedRows(feed){
     </div>`;
   }).join('');
   const hidden = feed.length - shown.length;
-  return rows + `<div class="pos" style="font-size:12px;margin-top:6px"><a href="#" onclick="showMinor=!showMinor;tick();return false">${showMinor ? 'hide' : 'show'} minor ticks${hidden ? ` (${hidden})` : ''}</a></div>`;
+  const head = `<div class="fev fhead"><span></span><span>Player</span><span class="fd">Pts</span><span>What happened</span><span class="fs" title="points x root/pt: change in your survival/win odds">Odds</span><span>Leagues</span></div>`;
+  return head + rows + `<div class="pos" style="font-size:12px;margin-top:6px"><a href="#" onclick="showMinor=!showMinor;tick();return false">${showMinor ? 'hide' : 'show'} minor ticks${hidden ? ` (${hidden})` : ''}</a></div>`;
 }
 
 function bookRows(book){
