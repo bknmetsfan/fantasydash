@@ -367,7 +367,76 @@ def load_plays():
 _INITIAL_LAST = re.compile(r"\b([A-Z][a-z]?)\.\s?([A-Z][A-Za-z'\-]+)")
 
 
-def build_feed(book, players=None):
+_FG_DIST = re.compile(r"(\d+) yard field goal", re.I)
+
+
+def play_stats(pl, roles, text):
+    """
+    {pid: {stat: value}} for one ESPN play, from the play type, net yardage
+    and each tagged player's role. Yardage bonuses are season-level, so they
+    are not priced here.
+    """
+    ptype = (pl.get("type") or {}).get("text", "") or ""
+    yards = pl.get("statYardage") or 0
+    td = bool(pl.get("scoringPlay")) and "touchdown" in text.lower()
+    low = text.lower()
+    out = {}
+    for pid, role in roles.items():
+        st = {}
+        if role == "pass" and ("pass" in low) and "incomplete" not in low:
+            if "intercepted" in low or "Interception" in ptype:
+                st["pass_int"] = 1
+            elif "attempt succeeds" in low:
+                st["pass_2pt"] = 1
+            else:
+                st["pass_yd"] = yards
+                if td:
+                    st["pass_td"] = 1
+        elif role == "rec":
+            if "attempt succeeds" in low:
+                st["rec_2pt"] = 1
+            elif "incomplete" not in low and "intercepted" not in low:
+                st["rec"] = 1
+                st["rec_yd"] = yards
+                if td:
+                    st["rec_td"] = 1
+        elif role == "rush" or (role == "pass" and "scrambles" in low):
+            if "attempt succeeds" in low:
+                st["rush_2pt"] = 1
+            else:
+                st["rush_yd"] = yards
+                if td:
+                    st["rush_td"] = 1
+        elif role == "kick":
+            if "field goal" in low:
+                m = _FG_DIST.search(text)
+                dist = int(m.group(1)) if m else 0
+                if "no good" in low or "missed" in low or "blocked" in low:
+                    st["fgmiss"] = 1
+                else:
+                    bucket = ("fgm_0_19" if dist < 20 else "fgm_20_29" if dist < 30 else "fgm_30_39" if dist < 40
+                              else "fgm_40_49" if dist < 50 else "fgm_50_59" if dist < 60 else "fgm_60p")
+                    st[bucket] = 1
+            elif "extra point is good" in low:
+                st["xpm"] = 1
+        if role == "fum" or (pid in roles and "fumble recovery (opponent)" in ptype.lower() and role in ("rush", "rec", "pass")):
+            if "fumbles" in low and "opponent" in ptype.lower():
+                st["fum_lost"] = 1
+        out[pid] = st
+    return out
+
+
+def price(stats, scoring, key=None):
+    """Points for a stat line under a scoring table. `key` selects Sleeper's
+    precomputed pts_* style for ppr/half/std manual teams."""
+    if key:
+        base = {"pts_ppr": {"rec": 1}, "pts_half_ppr": {"rec": 0.5}, "pts_std": {}}[key]
+        scoring = {"pass_yd": .04, "pass_td": 4, "pass_int": -1, "rush_yd": .1, "rush_td": 6,
+                   "rec_yd": .1, "rec_td": 6, "fum_lost": -2, "pass_2pt": 2, "rush_2pt": 2, "rec_2pt": 2, **base}
+    return round(sum(v * (scoring or {}).get(k, 0) for k, v in stats.items()), 2)
+
+
+def build_feed(book, players=None, scoring_by_tag=None):
     """
     Plays involving anyone in `book` (dicts with id/name/team/for/against/
     pts), newest first. Players are matched
@@ -429,6 +498,14 @@ def build_feed(book, players=None):
             except (ValueError, TypeError):
                 ts = time.time()
             q = pl.get("period", {}).get("number")
+            stats_by_pid = play_stats(pl, roles, text)
+            def deltas(h):
+                d = {}
+                for tag in list(h["for"]) + list(h["against"]):
+                    sc = (scoring_by_tag or {}).get(tag.replace(" (bench)", ""))
+                    if sc is not None:
+                        d[tag] = price(stats_by_pid.get(h["id"], {}), sc["scoring"], sc.get("key"))
+                return d
             out.append({
                 "id": pl.get("id"), "ts": ts, "t": time.strftime("%H:%M", time.localtime(ts)),
                 "game": g["label"], "q": f"Q{q}" if q and q <= 4 else "OT",
@@ -436,7 +513,8 @@ def build_feed(book, players=None):
                 "text": re.sub(r"^\((?:Shotgun|No Huddle|No Huddle, Shotgun)\)\s*", "", text),
                 "scoring": bool(pl.get("scoringPlay")),
                 "players": [{"id": h["id"], "name": h["name"], "for": h["for"], "against": h["against"],
-                             "pts": h["pts"], "role": roles.get(h["id"], "")} for h in hits.values()],
+                             "pts": h["pts"], "role": roles.get(h["id"], ""), "deltas": deltas(h)}
+                            for h in hits.values()],
             })
     out.sort(key=lambda e: -e["ts"])
     return out[:FEED_MAX]
@@ -572,6 +650,8 @@ def load_manual(players, projections, stats, games, week):
             "starters": resolved,
             "unmatched": missed,
             "stale_week": team.get("week") if stale else None,
+            "scoring": ELIMINATOR if scoring == "eliminator" else None,
+            "scoring_key": None if scoring == "eliminator" else "pts_" + scoring,
             "my_points": round(sum(actual.values()), 2),
             "my_proj": round(sum(proj.values()), 2),
             "my_to_play": to_play(det),
@@ -596,6 +676,23 @@ def load_manual(players, projections, stats, games, week):
 # ----------------------------------------------------------------------------
 
 ESPN_TEAM_FIX = {"WSH": "WAS"}     # ESPN abbreviations that differ from Sleeper's
+ESPN_SCORING_MAP = {
+    "PY": ["pass_yd"], "PTD": ["pass_td"], "INTT": ["pass_int"], "2PC": ["pass_2pt"],
+    "RY": ["rush_yd"], "RTD": ["rush_td"], "2PR": ["rush_2pt"],
+    "REC": ["rec"], "REY": ["rec_yd"], "RETD": ["rec_td"], "2PRE": ["rec_2pt"],
+    "FUML": ["fum_lost"], "PAT": ["xpm"], "FGM": ["fgmiss"],
+    "FG0": ["fgm_0_19", "fgm_20_29", "fgm_30_39"], "FG40": ["fgm_40_49"], "FG50": ["fgm_50_59"], "FG60": ["fgm_60p"],
+    "PRTD": ["pr_td"], "KRTD": ["kr_td"],
+}
+
+
+def espn_scoring(fmt):
+    """espn-api settings.scoring_format -> {sleeper stat: points}."""
+    out = {}
+    for row in fmt or []:
+        for k in ESPN_SCORING_MAP.get(row.get("abbr"), []):
+            out[k] = row.get("points") or 0.0
+    return out
 
 
 def espn_config():
@@ -741,6 +838,7 @@ def load_espn(week, players, games, stats):
                     "name": lc.get("name") or lg.settings.name,
                     "week": week, "mode": "h2h", "best_ball": False,
                     "weight": CONFIG["league_weights"].get(lid, 1.0),
+                    "scoring": espn_scoring(getattr(lg.settings, "scoring_format", None)),
                     "my_points": round(getattr(box, f"{me}_score") or 0.0, 2),
                     "my_proj": round(sum(my_proj.values()), 2),
                     "my_to_play": to_play(my_det),
@@ -859,8 +957,12 @@ def shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats):
     for t in teams:
         for r in t["lineup"]:
             roster.setdefault(r["pid"], {"id": r["pid"], "name": r["name"], "team": r["team"],
-                                         "pts": r["act"], "for": [], "against": []})
-    return {"teams": teams, "feed": build_feed(list(roster.values()))}
+                                         "pts": r["act"], "for": ["_"], "against": []})
+    feed = build_feed(list(roster.values()), None, {"_": {"scoring": entry.get("scoring")}})
+    for e in feed:                      # the "_" tag was only for pricing
+        for pp in e["players"]:
+            pp["for"] = []
+    return {"teams": teams, "feed": feed}
 
 
 # ----------------------------------------------------------------------------
@@ -977,6 +1079,7 @@ def build():
             "my_points": round(my_m.get("points") or 0.0, 2),
             "best_ball": best_ball,
             "weight": CONFIG["league_weights"].get(lid, 1.0),
+            "scoring": scoring,
             "my_proj": round(sum(my_proj.values()), 2),
             "my_to_play": to_play(my_det),
             "lineup": lineup_rows(my_det, players, stats),
@@ -1163,7 +1266,9 @@ def build():
                 pl = players.get(b["id"], {})
                 watch[b["id"]] = {"id": b["id"], "name": pl.get("name", b["id"]), "team": pl.get("team", ""),
                                   "pts": b["pts"], "for": [tag], "against": []}
-    feed = build_feed(list(watch.values()), players)
+    scoring_by_tag = {lg["name"][:14]: {"scoring": lg.get("scoring"), "key": lg.get("scoring_key")}
+                      for lg in out_leagues if lg["mode"] != "error"}
+    feed = build_feed(list(watch.values()), players, scoring_by_tag)
     log_snapshot(CONFIG["season"], week, out_leagues)   # pops the _log rows
     for lg in out_leagues:
         lg.pop("_log", None)
@@ -1488,8 +1593,9 @@ function feedRows(feed){
   if (!feed || !feed.length) return '<div class="pos" style="padding:6px 0 10px">No plays involving your players in games currently in progress.</div>';
   const shown = showMinor ? feed : feed.slice(0, 12);
   const rows = shown.map(e => {
-    const fors = [...new Set(e.players.flatMap(p => p.for))].join(', ');
-    const agst = [...new Set(e.players.flatMap(p => p.against))].join(', ');
+    const dfmt = (p, tag) => { const v = (p.deltas || {})[tag]; return v == null ? '' : ` <span class="num">${v > 0 ? '+' : ''}${v.toFixed(1)}</span>`; };
+    const tagList = side => { const seen = new Set(); return e.players.flatMap(p => p[side].map(t => `${t}${dfmt(p, t)}`)).filter(x => !seen.has(x) && seen.add(x)).join('<br>'); };
+    const fors = tagList('for'), agst = tagList('against');
     const who = e.players.map(p => `<b>${p.name}</b>${p.role ? ` <span class="pos">(${p.role})</span>` : ''}${p.pts != null ? ` <span class="num pos">${p.pts.toFixed(1)}</span>` : ''}`).join('<br>');
     return `<div class="fev ${e.scoring ? 'score' : ''}">
       <span class="num pos ft">${e.t}<br><span style="font-size:11px">${e.q} ${e.clock}</span></span>
@@ -1537,7 +1643,8 @@ function leagueTick(d){
     const mine = new Set(me.lineup.map(r => r.pid)), theirs = new Set((me.ref_lineup || []).map(r => r.pid));
     const feed = (d.feed || []).map(e => ({...e, players: e.players
         .filter(p => mine.has(p.id) || theirs.has(p.id))
-        .map(p => ({...p, for: mine.has(p.id) ? ['you'] : [], against: theirs.has(p.id) ? [me.proj_ref.name] : []}))}))
+        .map(p => ({...p, for: mine.has(p.id) ? ['you'] : [], against: theirs.has(p.id) ? [me.proj_ref.name] : [],
+                    deltas: {you: (p.deltas || {})._, [me.proj_ref.name]: (p.deltas || {})._}}))}))
       .filter(e => e.players.length);
     html += section('feed', 'Feed', feedRows(feed), feed.length);
   } else {
