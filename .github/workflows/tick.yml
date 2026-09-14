@@ -1,0 +1,14 @@
+# Keep fantasydash awake and logging during NFL game windows.
+# Times are UTC. ET windows: Thu 8pm-1am, Sun 9:30am-1am, Mon 8pm-1am.
+# (Off by an hour around the DST change in November; harmless.)
+name: tick
+on:
+  schedule:
+    - cron: "*/5 13-23 * 9-12,1 0"      # Sunday 13:00-23:59 UTC
+    - cron: "*/5 0-4 * 9-12,1 1,2,5"    # Mon/Tue/Fri 00:00-04:59 UTC (Sun/Mon/Thu night ET)
+  workflow_dispatch:
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS --max-time 60 https://fantasydash.fly.dev/tick

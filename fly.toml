@@ -11,9 +11,9 @@ primary_region = "ewr"
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "off"       # keep the calibration log recording
-  auto_start_machines = true
-  min_machines_running = 1
+  auto_stop_machines = "stop"      # sleep when idle; the game-window cron in
+  auto_start_machines = true       # .github/workflows/tick.yml keeps it awake
+  min_machines_running = 0         # (and logging) while games are on
 
   [[http_service.checks]]
     interval = "30s"

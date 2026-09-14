@@ -1299,7 +1299,7 @@ def build():
 def basic_auth():
     """Single shared password via BLOTTER_PASSWORD; open when unset (local)."""
     pw = os.environ.get("BLOTTER_PASSWORD")
-    if not pw or request.path == "/healthz" or request.path.startswith(("/l/", "/api/league/")):
+    if not pw or request.path in ("/healthz", "/tick") or request.path.startswith(("/l/", "/api/league/")):
         return None
     auth = request.headers.get("Authorization", "")
     ok = False
@@ -1362,6 +1362,16 @@ def league_page(lid):
 @app.route("/healthz")
 def healthz():
     return "ok"
+
+
+@app.route("/tick")
+def tick():
+    """Unauthenticated poke that runs a build (and so a log snapshot). Hit by
+    the game-window cron so the calibration log records without a viewer."""
+    data, err = current_state()
+    if err:
+        return Response(f"error: {err}", 502)
+    return Response(f"ok wk{data['week']} {data['updated']}", mimetype="text/plain")
 
 
 @app.route("/")
