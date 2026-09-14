@@ -960,7 +960,7 @@ def shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats):
             "best_ball": entry["best_ball"], "week": entry["week"],
             "rid": rid, "team": f["name"], "my_rid": rid,
             "my_points": f["pts"], "my_proj": f["proj"], "my_to_play": f["to_play"],
-            "field": field, "field_size": n,
+            "field_size": n,                # field is sent once, see api_league
             "rank": n - li, "margin": margin, "ref": ref,
             "below": field[li - 1] if li > 0 else None,
             "above": field[li + 1] if li + 1 < n else None,
@@ -979,7 +979,7 @@ def shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats):
     for e in feed:                      # the "_" tag was only for pricing
         for pp in e["players"]:
             pp["for"] = []
-    return {"teams": teams, "feed": feed}
+    return {"teams": teams, "feed": feed, "field": field}
 
 
 # ----------------------------------------------------------------------------
@@ -1350,7 +1350,8 @@ def api_league(lid):
     if not lg:
         return jsonify({"error": "league not found"}), 404
     return jsonify({"week": data["week"], "updated": data["updated"], "stale": data.get("stale"),
-                    "name": lg["name"], "teams": lg["shared"]["teams"], "feed": lg["shared"]["feed"]})
+                    "name": lg["name"], "teams": lg["shared"]["teams"], "feed": lg["shared"]["feed"],
+                    "field": lg["shared"]["field"]})
 
 
 @app.route("/l/<lid>")
@@ -1673,6 +1674,7 @@ function bookRows(book){
 
 function leagueTick(d){
   // Leaguemate view: pick a team, see the chop picture from that seat.
+  d.teams.forEach(t => { t.field = d.field; });
   const key = 'team:' + LEAGUE_ID;
   const fromUrl = new URLSearchParams(location.search).get('team');
   let rid = fromUrl || (() => { try { return localStorage.getItem(key); } catch(e){ return null; } })();
