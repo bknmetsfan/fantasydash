@@ -1133,6 +1133,8 @@ def build():
             pfield = sorted(field, key=lambda x: x["proj"])
             prank = [f["rid"] for f in pfield].index(my_rid)
             pmargin, pref = chop_line(pfield, prank, "proj")
+            for f in field:
+                f["lineup"] = lineup_rows(proj_by_rid[f["rid"]][2], players, stats)
             # Chop probability: share of sims in which each team is the low score.
             mat = np.array([sims[f["rid"]] for f in field])
             share = np.bincount(mat.argmin(axis=0), minlength=len(field)) / mat.shape[1]
@@ -1444,6 +1446,11 @@ PAGE = r"""<!doctype html>
   .detail td,.detail th{padding:3px 8px 3px 0}
   .detail tr.me td{font-weight:600}
   .detail tr.line td{border-bottom:2px solid var(--short)}
+  .detail tr.trow{cursor:pointer}
+  .detail tr.trow:hover td{background:var(--bg)}
+  .detail tr.trow .caret{display:inline-block;width:10px;font-size:10px;color:var(--mute)}
+  .detail tr.tdetail > td{padding:2px 0 10px 22px;border-bottom:1px solid var(--rule)}
+  .detail tr.tdetail h3{margin-top:4px}
   .detail .rk{color:var(--mute);width:2.2em}
   .detail table.lineup td{white-space:nowrap}
   .detail table.lineup td:nth-child(3){white-space:normal;font-size:12px;min-width:160px}
@@ -1521,12 +1528,16 @@ function poolDetail(l){
   return `<div class="detail">
     <h3>Field · by proj final (chop line above the last row) · live rank in grey</h3>
     <table><tr><th class="rk">#</th><th>Team</th><th class="r">Chop %</th><th class="r">Proj final</th><th class="r">Pts</th><th class="r">To play</th><th class="r">Live #</th></tr>
-    ${proj.map((t,i) => `<tr class="${t.rid === me ? 'me' : ''} ${i === n - 2 ? 'line' : ''}">
-      <td class="rk num">${i+1}</td><td>${t.name}</td>
+    ${proj.map((t,i) => {
+      const key = `team:${l.league_id}:${t.rid}`, isOpen = open.has(key);
+      return `<tr class="${t.rid === me ? 'me' : ''} ${i === n - 2 ? 'line' : ''} trow" onclick="event.stopPropagation();toggle('${key}')">
+      <td class="rk num">${i+1}</td><td><span class="caret">${isOpen ? '▾' : '▸'}</span> ${t.name}</td>
       <td class="r num ${t.chop_pct >= 15 ? 'short' : ''}">${Math.round(t.chop_pct)}</td>
       <td class="r num">${f2(t.proj)}</td><td class="r num">${f2(t.pts)}</td>
       <td class="r num pos">${t.to_play[0]}${t.to_play[1] ? `<span style="color:var(--warn)"> ·${t.to_play[1]}</span>` : ''}</td>
-      <td class="r num pos">${lrank[t.rid]}</td></tr>`).join('')}
+      <td class="r num pos">${lrank[t.rid]}</td></tr>
+      ${isOpen && t.lineup ? `<tr class="tdetail"><td colspan="7">${lineupTable(t.name, t.lineup)}</td></tr>` : ''}`;
+    }).join('')}
     </table>
     ${lineupTable('Your lineup', l.lineup)}
     ${benchBlock(l)}
