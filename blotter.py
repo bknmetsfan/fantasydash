@@ -909,17 +909,26 @@ def log_snapshot(season, week, leagues):
             rid TEXT, mine INTEGER, pid TEXT, name TEXT, pos TEXT, team TEXT,
             act REAL, proj REAL, rem REAL);
         CREATE INDEX IF NOT EXISTS players_wk ON players (season, week, pid);
+        CREATE INDEX IF NOT EXISTS players_lg ON players (season, week, league_id, ts);
+        CREATE TABLE IF NOT EXISTS teams (
+            season TEXT, week INTEGER, league_id TEXT, rid TEXT, name TEXT,
+            PRIMARY KEY (season, week, league_id, rid));
         CREATE TABLE IF NOT EXISTS leagues (
             ts INTEGER, season TEXT, week INTEGER, league_id TEXT, league TEXT, mode TEXT,
             my_points REAL, my_proj REAL, pct REAL, sens REAL, rank INTEGER, field_size INTEGER,
             to_play INTEGER, live INTEGER);
     """)
-    prow, lrow = [], []
+    prow, lrow, trow = [], [], []
     for lg in leagues:
         if lg["mode"] == "error":
             continue
         for r in lg.pop("_log", []):
             prow.append((ts, season, week, lg["league_id"], lg["name"], *r))
+        for f in lg.get("field") or []:
+            trow.append((season, week, lg["league_id"], str(f["rid"]), f["name"]))
+        for pair in lg.get("matchups") or []:
+            for t in pair:
+                trow.append((season, week, lg["league_id"], str(t["rid"]), t["name"]))
         tp = lg.get("my_to_play") or (None, None)
         lrow.append((ts, season, week, lg["league_id"], lg["name"], lg["mode"],
                      lg.get("my_points"), lg.get("my_proj"),
@@ -927,6 +936,7 @@ def log_snapshot(season, week, leagues):
                      lg.get("rank"), lg.get("field_size"), tp[0], tp[1]))
     con.executemany("INSERT INTO players VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", prow)
     con.executemany("INSERT INTO leagues VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lrow)
+    con.executemany("INSERT OR REPLACE INTO teams VALUES (?,?,?,?,?)", trow)
     con.commit()
     con.close()
     _log_last["ts"] = time.time()
@@ -1303,6 +1313,8 @@ def basic_auth():
     pw = os.environ.get("BLOTTER_PASSWORD")
     if not pw or request.path in ("/healthz", "/tick") or request.path.startswith(("/l/", "/api/league/")):
         return None
+    if request.path.startswith("/api/history/") and request.path.rsplit("/", 1)[-1] in CONFIG["shared_leagues"]:
+        return None
     auth = request.headers.get("Authorization", "")
     ok = False
     if auth.startswith("Basic "):
@@ -1352,6 +1364,55 @@ def api_league(lid):
     return jsonify({"week": data["week"], "updated": data["updated"], "stale": data.get("stale"),
                     "name": lg["name"], "teams": lg["shared"]["teams"], "feed": lg["shared"]["feed"],
                     "field": lg["shared"]["field"]})
+
+
+@app.route("/api/history/<lid>")
+def api_history(lid):
+    """
+    Each team's live points and projected final over the week, from the
+    calibration log: one point per snapshot, downsampled to ~400 per team.
+    """
+    week = request.args.get("week", type=int)
+    season = CONFIG["season"]
+    if not LOG_DB.exists():
+        return jsonify({"teams": [], "week": week})
+    con = sqlite3.connect(LOG_DB)
+    if week is None:
+        week = (con.execute("SELECT MAX(week) FROM players WHERE season=? AND league_id=?", (season, lid)).fetchone()[0]
+                or (_cache["data"] or {}).get("week") or 1)
+    rows = con.execute(
+        "SELECT ts, rid, ROUND(SUM(act), 2), ROUND(SUM(act + proj * rem), 2) FROM players "
+        "WHERE season=? AND week=? AND league_id=? GROUP BY ts, rid ORDER BY ts", (season, week, lid)).fetchall()
+    names = dict(con.execute("SELECT rid, name FROM teams WHERE season=? AND week=? AND league_id=?",
+                             (season, week, lid)).fetchall())
+    con.close()
+    # Fall back to live names for snapshots taken before the teams table existed.
+    live = next((l for l in (_cache["data"] or {}).get("leagues", []) if l["league_id"] == lid), None)
+    for f in (live or {}).get("field") or []:
+        names.setdefault(str(f["rid"]), f["name"])
+    series = {}
+    for ts, rid, pts, proj in rows:
+        series.setdefault(rid, []).append([ts, pts, proj])
+    # Trim the trailing flat run (post-game snapshots) so the axis ends when
+    # the last score moved, keeping one point past it.
+    snaps = sorted({ts for ts, *_ in rows})
+    by_ts = {}
+    for ts, rid, pts, proj in rows:
+        by_ts.setdefault(ts, {})[rid] = (pts, proj)
+    last_change = snaps[0] if snaps else 0
+    for a, b in zip(snaps, snaps[1:]):
+        if by_ts[a] != by_ts[b]:
+            last_change = b
+    cut = next((t for t in snaps if t > last_change), None)
+    if cut is not None:
+        series = {rid: [pt for pt in v if pt[0] <= cut] for rid, v in series.items()}
+    step = max(1, max((len(v) for v in series.values()), default=1) // 400)
+    my_rid = str((live or {}).get("my_rid", ""))
+    teams = [{"rid": rid, "name": names.get(rid, f"Roster {rid}"), "me": rid == my_rid,
+              "series": v[::step] + ([v[-1]] if (len(v) - 1) % step else [])}
+             for rid, v in series.items()]
+    teams.sort(key=lambda t: -t["series"][-1][2])
+    return jsonify({"week": week, "league_id": lid, "teams": teams})
 
 
 @app.route("/l/<lid>")
@@ -1464,6 +1525,13 @@ PAGE = r"""<!doctype html>
   .fev .fd{text-align:right}
   .fev .tags{padding-left:0;font-weight:400}
   .fev .fwhat{font-size:12.5px}
+  .chartwrap{margin:4px 0 14px}
+  .chartbar{font-size:12.5px;margin-bottom:6px}
+  .chartbar a{color:var(--mute);text-decoration:none}
+  .chartbar a.on{color:var(--ink);font-weight:600;text-decoration:underline}
+  .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;margin-top:6px}
+  .lg-item{cursor:pointer;white-space:nowrap}
+  .lg-item input{vertical-align:middle;margin:0 2px 0 0}
   .pick{margin:0 0 18px;font-size:13px;color:var(--mute)}
   .pick select{font:inherit;padding:4px 8px;border:1px solid var(--rule);background:var(--panel);color:var(--ink)}
   @media (prefers-reduced-motion:no-preference){
@@ -1518,6 +1586,77 @@ function benchBlock(l){
     ${isOpen ? lineupTable('Bench', rows).replace(/<h3>.*?<\/h3>/, '') : ''}`;
 }
 
+// ---- history chart ----
+const hist = {};            // league_id -> {ts, data}
+const chartSel = {};        // league_id -> Set of rids shown
+const chartWeek = {};       // league_id -> week being viewed (undefined = current)
+let chartMode = 'proj';     // 'proj' | 'pts'
+const PALETTE = ['#1F6F4A','#A6402B','#2B5FA6','#B07A16','#6B3FA0','#0F8B8D','#C2185B','#5D6D1E',
+                 '#8C5A2B','#3C3C8C','#A02B7A','#2B8C5A','#7A4A1F','#1F7A8C','#8C1F3C','#4A6B1F','#6B2B8C','#8C6B1F'];
+
+function histFresh(lid){ const h = hist[lid]; return h && h.week === chartWeek[lid] && Date.now() - h.ts < 60000; }
+async function loadHistory(lid){
+  if (histFresh(lid)) return hist[lid].data;
+  try {
+    const wk = chartWeek[lid];
+    const d = await (await fetch(`/api/history/${lid}${wk ? `?week=${wk}` : ''}`)).json();
+    hist[lid] = {ts: Date.now(), week: wk, data: d};
+    return d;
+  } catch(e){ return null; }
+}
+function chartSetWeek(lid, wk){ chartWeek[lid] = wk; delete chartSel[lid]; tick(); }
+
+function chartToggleTeam(lid, rid){
+  const sel = chartSel[lid]; sel.has(rid) ? sel.delete(rid) : sel.add(rid); tick();
+}
+
+function historyChart(l, d){
+  if (!d || !d.teams.length) return '<div class="pos">No history logged for this week yet.</div>';
+  if (!chartSel[l.league_id]){
+    // Default: you, the projected chop line, and the two teams above it.
+    const bottom = [...d.teams].slice(-3).map(t => t.rid);
+    chartSel[l.league_id] = new Set([...bottom, ...d.teams.filter(t => t.me).map(t => t.rid)]);
+  }
+  const sel = chartSel[l.league_id];
+  const idx = chartMode === 'proj' ? 2 : 1;
+  const shown = d.teams.filter(t => sel.has(t.rid));
+  const W = 820, H = 300, L = 44, R = 12, T = 10, B = 28;
+  const all = shown.flatMap(t => t.series);
+  const x0 = Math.min(...d.teams.flatMap(t => [t.series[0][0]])), x1 = Math.max(...d.teams.flatMap(t => [t.series[t.series.length-1][0]]));
+  const ys = all.map(p => p[idx]);
+  let y0 = Math.min(...ys, chartMode === 'pts' ? 0 : Infinity), y1 = Math.max(...ys);
+  if (!isFinite(y0) || !isFinite(y1)) return '<div class="pos">Pick a team to plot.</div>';
+  if (y1 - y0 < 10) y1 = y0 + 10;
+  const pad = (y1 - y0) * 0.05; y0 -= pad; y1 += pad;
+  const X = t => L + (t - x0) / Math.max(1, x1 - x0) * (W - L - R);
+  const Y = v => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
+  const hh = t => { const dt = new Date(t * 1000); return dt.getHours() + ':' + String(dt.getMinutes()).padStart(2, '0'); };
+  // axes: 5 y ticks, x ticks every ~2h
+  let g = '';
+  for (let i = 0; i <= 4; i++){ const v = y0 + (y1 - y0) * i / 4; g += `<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--rule)"/><text x="${L-6}" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--mute)">${v.toFixed(0)}</text>`; }
+  const span = x1 - x0, stepH = span > 8*3600 ? 2 : 1;
+  for (let t = Math.ceil(x0 / 3600) * 3600; t <= x1; t += stepH * 3600) g += `<text x="${X(t)}" y="${H-8}" text-anchor="middle" font-size="11" fill="var(--mute)">${hh(t)}</text>`;
+  // lines: break where the log has a gap > 20 min
+  const lines = shown.map(t => {
+    const col = PALETTE[d.teams.indexOf(t) % PALETTE.length];
+    let path = '', prev = null;
+    for (const p of t.series){ path += (prev === null || p[0] - prev > 1200 ? 'M' : 'L') + `${X(p[0]).toFixed(1)},${Y(p[idx]).toFixed(1)} `; prev = p[0]; }
+    const last = t.series[t.series.length - 1];
+    return `<path d="${path}" fill="none" stroke="${col}" stroke-width="${t.me ? 2.5 : 1.5}" ${t.me ? '' : 'opacity=".85"'}/>
+      <text x="${X(last[0]) + 4}" y="${Y(last[idx]) + 4}" font-size="11" fill="${col}">${last[idx].toFixed(1)}</text>`;
+  }).join('');
+  const legend = d.teams.map(t => { const col = PALETTE[d.teams.indexOf(t) % PALETTE.length], on = sel.has(t.rid);
+    return `<label class="lg-item" style="opacity:${on ? 1 : .45}"><input type="checkbox" ${on ? 'checked' : ''} onclick="event.stopPropagation();chartToggleTeam('${l.league_id}','${t.rid}')"> <span style="color:${col}">■</span> ${t.name}${t.me ? ' (you)' : ''}</label>`; }).join('');
+  return `<div class="chartwrap" onclick="event.stopPropagation()">
+    <div class="chartbar"><span class="pos"><a href="#" onclick="chartSetWeek('${l.league_id}',${d.week-1});return false">‹</a> week ${d.week} ${d.week < l.week ? `<a href="#" onclick="chartSetWeek('${l.league_id}',${d.week+1});return false">›</a>` : ''} · </span>
+      <a href="#" class="${chartMode === 'proj' ? 'on' : ''}" onclick="chartMode='proj';tick();return false">projected final</a> ·
+      <a href="#" class="${chartMode === 'pts' ? 'on' : ''}" onclick="chartMode='pts';tick();return false">live points</a>
+      <span class="pos"> · <a href="#" onclick="chartSel['${l.league_id}']=new Set(${JSON.stringify(d.teams.map(t=>t.rid))});tick();return false">all</a> · <a href="#" onclick="chartSel['${l.league_id}']=new Set();tick();return false">none</a></span></div>
+    <svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block;font-family:'IBM Plex Mono',monospace">${g}${lines}</svg>
+    <div class="legend">${legend}</div>
+  </div>`;
+}
+
 function poolDetail(l){
   // Field sorted by projected final, high -> low: the projected chop is the
   // last row, line drawn above it. Live rank alongside in grey (l.field is
@@ -1526,7 +1665,11 @@ function poolDetail(l){
   const lrank = Object.fromEntries(l.field.map((t,i) => [t.rid, n - i]));
   const me = l.my_rid;
   const proj = [...l.field].sort((a,b) => b.proj - a.proj);
+  const ck = 'chart:' + l.league_id, chartOpen = open.has(ck);
+  if (chartOpen && !histFresh(l.league_id)) loadHistory(l.league_id).then(() => tick());
   return `<div class="detail">
+    <h3 style="cursor:pointer" onclick="event.stopPropagation();toggle('${ck}')">Chart · <span style="text-decoration:underline">${chartOpen ? 'hide' : 'show'}</span></h3>
+    ${chartOpen ? (histFresh(l.league_id) ? historyChart(l, hist[l.league_id].data) : '<div class="pos">loading…</div>') : ''}
     <h3>Field · by proj final (chop line above the last row) · live rank in grey</h3>
     <table><tr><th class="rk">#</th><th>Team</th><th class="r">Chop %</th><th class="r">Proj final</th><th class="r">Pts</th><th class="r">To play</th><th class="r">Live #</th></tr>
     ${proj.map((t,i) => {
