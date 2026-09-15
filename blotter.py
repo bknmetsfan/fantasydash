@@ -1366,6 +1366,21 @@ def api_league(lid):
                     "field": lg["shared"]["field"]})
 
 
+_roster_names = {}
+
+
+def roster_names(lid):
+    """{roster_id: display_name} straight from Sleeper, cached for the process."""
+    if lid not in _roster_names:
+        try:
+            users = {u["user_id"]: u.get("display_name") or "?" for u in get(f"/league/{lid}/users")}
+            _roster_names[lid] = {str(r["roster_id"]): users.get(r.get("owner_id"), f"Roster {r['roster_id']}")
+                                  for r in get(f"/league/{lid}/rosters")}
+        except Exception:
+            return {}
+    return _roster_names[lid]
+
+
 @app.route("/api/history/<lid>")
 def api_history(lid):
     """
@@ -1386,10 +1401,19 @@ def api_history(lid):
     names = dict(con.execute("SELECT rid, name FROM teams WHERE season=? AND week=? AND league_id=?",
                              (season, week, lid)).fetchall())
     con.close()
-    # Fall back to live names for snapshots taken before the teams table existed.
+    # Snapshots older than the teams table (Week 1) have no stored names, and
+    # chopped teams have left the live field: ask Sleeper, whose rosters list
+    # keeps eliminated teams. Cached per league; also written back to the log.
+    missing = {rid for _, rid, *_ in rows} - set(names)
+    if missing and not lid.startswith(("espn:", "manual:")):
+        fetched = roster_names(lid)
+        con = sqlite3.connect(LOG_DB)
+        con.executemany("INSERT OR REPLACE INTO teams VALUES (?,?,?,?,?)",
+                        [(season, week, lid, rid, fetched[rid]) for rid in missing if rid in fetched])
+        con.commit()
+        con.close()
+        names.update({rid: fetched[rid] for rid in missing if rid in fetched})
     live = next((l for l in (_cache["data"] or {}).get("leagues", []) if l["league_id"] == lid), None)
-    for f in (live or {}).get("field") or []:
-        names.setdefault(str(f["rid"]), f["name"])
     series = {}
     for ts, rid, pts, proj in rows:
         series.setdefault(rid, []).append([ts, pts, proj])
