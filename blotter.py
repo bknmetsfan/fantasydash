@@ -1468,12 +1468,13 @@ def waiver_report(lid):
     rostered = {p for r in rosters for p in r["players"]}
     chop_pool, chop_name = set(), None
     if week > 1:
+        # Last week's lowest scorer across ALL rosters. If Sleeper has already
+        # emptied that roster its players are plain free agents; if it still
+        # holds them (manual elimination), they're the pending chop pool.
         prev = get(f"/league/{lid}/matchups/{week - 1}") or []
-        alive = {r["roster_id"] for r in rosters}
-        low = min((m for m in prev if m["roster_id"] in alive and (m.get("points") or 0) > 0),
-                  key=lambda m: m.get("points") or 0, default=None)
-        if low and low["roster_id"] != my_rid:
-            chopped = next(r for r in rosters if r["roster_id"] == low["roster_id"])
+        low = min((m for m in prev if (m.get("points") or 0) > 0), key=lambda m: m.get("points") or 0, default=None)
+        chopped = next((r for r in rosters if low and r["roster_id"] == low["roster_id"]), None)
+        if chopped and chopped["roster_id"] != my_rid:
             chop_pool = set(chopped["players"])
             chop_name = users.get(chopped.get("owner_id"), "?")
             rostered -= chop_pool
