@@ -10,6 +10,8 @@ ESPN leagues go in espn.json (see espn.example.json; needs espn_s2 + SWID).
 """
 
 import base64
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -1307,13 +1309,30 @@ def build():
             "updated": time.strftime("%H:%M:%S")}
 
 
+AUTH_COOKIE = "fd_auth"
+AUTH_DAYS = 30
+
+
+def auth_token(pw):
+    """Cookie value proving the password was entered: HMAC over a fixed
+    message keyed by the password, so changing the password revokes it."""
+    return hmac.new(hashlib.sha256(pw.encode()).digest(), b"fantasydash-session", hashlib.sha256).hexdigest()
+
+
 @app.before_request
 def basic_auth():
-    """Single shared password via BLOTTER_PASSWORD; open when unset (local)."""
+    """
+    Single shared password via BLOTTER_PASSWORD; open when unset (local).
+    A successful Basic login also sets a 30-day cookie, so browsers that
+    don't reattach Basic credentials to fetch() (iOS Safari) only prompt
+    once per device.
+    """
     pw = os.environ.get("BLOTTER_PASSWORD")
     if not pw or request.path in ("/healthz", "/tick") or request.path.startswith(("/l/", "/api/league/")):
         return None
     if request.path.startswith("/api/history/") and request.path.rsplit("/", 1)[-1] in CONFIG["shared_leagues"]:
+        return None
+    if hmac.compare_digest(request.cookies.get(AUTH_COOKIE, ""), auth_token(pw)):
         return None
     auth = request.headers.get("Authorization", "")
     ok = False
@@ -1325,6 +1344,15 @@ def basic_auth():
             ok = False
     if not ok:
         return Response("auth required", 401, {"WWW-Authenticate": 'Basic realm="blotter"'})
+    request.set_auth_cookie = True
+
+
+@app.after_request
+def set_auth_cookie(resp):
+    if getattr(request, "set_auth_cookie", False):
+        resp.set_cookie(AUTH_COOKIE, auth_token(os.environ["BLOTTER_PASSWORD"]), max_age=AUTH_DAYS * 86400,
+                        httponly=True, secure=request.is_secure, samesite="Lax")
+    return resp
 
 
 def current_state():
