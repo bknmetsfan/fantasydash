@@ -1507,10 +1507,12 @@ def waiver_report(lid, as_rid=None):
     mat_all = np.array([sims[rid] for rid in rids])
     chop_all = np.bincount(mat_all.argmin(axis=0), minlength=len(rids)) / mat_all.shape[1]
     field = []
+    budget = (lg.get("settings") or {}).get("waiver_budget") or 0
     for rid, r in zip(rids, rosters):
         det = dets[rid]
         split = {lbl: round(val(pid), 2) for lbl, pid in by_slot[rid]}
         field.append({"rid": rid, "name": users.get(r.get("owner_id"), f"Roster {rid}"),
+                      "faab": budget - ((r.get("settings") or {}).get("waiver_budget_used") or 0),
                       "proj": round(sum(d["proj"] for d in det.values()), 2),
                       "chop_pct": round(100 * float(chop_all[rids.index(rid)]), 1),
                       "split": split, "me": rid == my_rid})
@@ -1983,10 +1985,11 @@ function waiverSection(pools){
     body += `<div class="pos num" style="margin-bottom:10px">week ${d.week} · everyone on optimal lineups · ${who} proj <b>${f2(d.base.proj)}</b>, chop <b class="${d.base.chop_pct >= 15 ? 'short' : ''}">${d.base.chop_pct}%</b>${d.faab.budget ? ` · FAAB left <b>${d.faab.budget - d.faab.used}</b> of ${d.faab.budget}` : ''}</div>`;
     const posCols = d.slot_order || [];
     body += `<h3>Field · everyone's optimal lineup by projection, by slot</h3>
-      <table><tr><th class="rk">#</th><th>Team</th><th class="r">Proj</th><th class="r">Chop %</th>${posCols.map(c => `<th class="r">${c}</th>`).join('')}</tr>
+      <table><tr><th class="rk">#</th><th>Team</th><th class="r">Proj</th><th class="r">Chop %</th><th class="r">FAAB</th>${posCols.map(c => `<th class="r">${c}</th>`).join('')}</tr>
       ${d.field.map((f, i) => `<tr class="${f.me ? 'me' : ''} ${i === d.field.length - 2 ? 'line' : ''}">
         <td class="rk num">${i+1}</td><td>${f.name}${f.me ? (d.as.is_me ? ' <span class="pos">(you)</span>' : ' <span class="warnc">(as)</span>') : ''}</td>
         <td class="r num">${f2(f.proj)}</td><td class="r num ${f.chop_pct >= 15 ? 'short' : ''}">${Math.round(f.chop_pct)}</td>
+        <td class="r num ${d.faab.budget && f.faab < d.faab.budget * 0.25 ? 'short' : 'pos'}">${d.faab.budget ? f.faab : '—'}</td>
         ${posCols.map(c => { const v = f.split[c]; const col = d.field.map(x => x.split[c] || 0); const lo = [...col].sort((a,b)=>a-b)[Math.floor(col.length/3)]; return `<td class="r num ${v != null && v <= lo ? 'short' : 'pos'}">${v == null ? '—' : v.toFixed(1)}</td>`; }).join('')}</tr>`).join('')}</table>`;
     const gapCls = g => g >= -1.5 ? 'warnc' : 'pos';
     body += `<h3>${d.as.is_me ? 'Your' : d.as.name + "'s"} optimal lineup · ✓ = currently set on Sleeper · bench alternatives with projection gap</h3>
