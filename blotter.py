@@ -1526,8 +1526,10 @@ def waiver_report(lid, as_rid=None):
     # Free agents: projected players nobody in the (surviving) league rosters,
     # plus the pending chop pool identified above.
     rostered = {p for r in rosters for p in r["players"]}
+    # Only positions the league has a slot for (no DEF/K in leagues without them).
+    usable = set().union(*(ELIGIBLE.get(sl, {sl}) for sl in slots if sl not in NON_SLOTS)) & WAIVER_POS
     fas = sorted((pid for pid in set(projections) | chop_pool if pid not in rostered
-                  and players.get(pid, {}).get("pos") in WAIVER_POS and players.get(pid, {}).get("team", "FA") != "FA"),
+                  and players.get(pid, {}).get("pos") in usable and players.get(pid, {}).get("team", "FA") != "FA"),
                  key=lambda p: -val(p))[:WAIVER_TOP]
     old_lineup = set(my_det)
     cands = []
