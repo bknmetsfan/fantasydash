@@ -1581,6 +1581,7 @@ PAGE = r"""<!doctype html>
   .fev .fd{text-align:right}
   .fev .tags{padding-left:0;font-weight:400}
   .fev .fwhat{font-size:12.5px}
+  .chartsec{background:var(--panel);padding:10px 14px 12px;border-left:3px solid var(--rule)}
   .chartwrap{margin:4px 0 14px}
   .chartbar{font-size:12.5px;margin-bottom:6px}
   .chartbar a{color:var(--mute);text-decoration:none}
@@ -1720,6 +1721,23 @@ function historyChart(l, d){
   </div>`;
 }
 
+let chartLeague = null;     // league_id shown in the chart section
+function chartSection(pools){
+  if (!pools.length) return '';
+  if (!chartLeague || !pools.some(l => l.league_id === chartLeague)) chartLeague = pools[0].league_id;
+  const l = pools.find(x => x.league_id === chartLeague);
+  if (collapsed.has('chart')) return section('chart', 'Chart', '');
+  if (!histFresh(l.league_id)) loadHistory(l.league_id).then(() => tick());
+  const picker = pools.length > 1
+    ? `<select onchange="chartLeague=this.value;tick()">${pools.map(x => `<option value="${x.league_id}" ${x.league_id === chartLeague ? 'selected' : ''}>${x.name}</option>`).join('')}</select>`
+    : `<b>${l.name}</b>`;
+  const body = `<div class="chartsec">
+    <div class="pick" style="margin-bottom:8px">League &nbsp;${picker}</div>
+    ${histFresh(l.league_id) ? historyChart(l, hist[l.league_id].data) : '<div class="pos">loading…</div>'}
+  </div>`;
+  return section('chart', 'Chart', body);
+}
+
 function poolDetail(l){
   // Field sorted by projected final, high -> low: the projected chop is the
   // last row, line drawn above it. Live rank alongside in grey (l.field is
@@ -1728,11 +1746,7 @@ function poolDetail(l){
   const lrank = Object.fromEntries(l.field.map((t,i) => [t.rid, n - i]));
   const me = l.my_rid;
   const proj = [...l.field].sort((a,b) => b.proj - a.proj);
-  const ck = 'chart:' + l.league_id, chartOpen = open.has(ck);
-  if (chartOpen && !histFresh(l.league_id)) loadHistory(l.league_id).then(() => tick());
   return `<div class="detail">
-    <h3 style="cursor:pointer" onclick="event.stopPropagation();toggle('${ck}')">Chart · <span style="text-decoration:underline">${chartOpen ? 'hide' : 'show'}</span></h3>
-    ${chartOpen ? (histFresh(l.league_id) ? historyChart(l, hist[l.league_id].data) : '<div class="pos">loading…</div>') : ''}
     <h3>Field · by proj final (chop line above the last row) · live rank in grey</h3>
     <table><tr><th class="rk">#</th><th>Team</th><th class="r">Chop %</th><th class="r">Proj final</th><th class="r">Pts</th><th class="r">To play</th><th class="r">Live #</th></tr>
     ${proj.map((t,i) => {
@@ -1900,6 +1914,7 @@ function leagueTick(d){
                     deltas: {you: (p.deltas || {})._, [me.proj_ref.name]: (p.deltas || {})._}}))}))
       .filter(e => e.players.length);
     html += section('feed', 'Feed', feedRows(feed), feed.length);
+    html += chartSection([me]);
   } else {
     html += `<div class="pos" style="margin:12px 0 20px">Pick your team to see your margin, survival odds and lineup.</div>`;
   }
@@ -1931,9 +1946,11 @@ async function tick(){
   if (h2h.length) html += section('h2h', 'Head to head', h2h.map(h2hRow).join(''));
   if (manual.length) html += section('solo', 'Solo', manual.map(manualRow).join(''));
   html += section('feed', 'Feed', feedRows(d.feed), (d.feed || []).length);
-  html += section('book', 'Exposure', `<table>
+  const bookHtml = `<table>
     <tr><th>Player</th><th class="r">Pts</th><th class="r">Proj final</th><th class="r" title="root x remaining projection: swing still on the table">Impact</th><th class="r" title="pp of survival/win per fantasy point, summed over leagues">Root /pt</th><th>Leagues</th></tr>
-    ${bookRows(d.book)}</table>`, d.book.length);
+    ${bookRows(d.book)}</table>`;
+  html += section('book', 'Exposure', bookHtml, d.book.length);
+  html += chartSection(pools);
   if (manual.length){
     const bad = manual.flatMap(m => m.unmatched);
     if (bad.length) html += `<div class="err">Unmatched names in manual.json: ${bad.join(', ')}. Fix the spelling to fold them into exposure.</div>`;
