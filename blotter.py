@@ -1645,7 +1645,7 @@ function historyChart(l, d){
   const sel = chartSel[l.league_id];
   const idx = chartMode === 'proj' ? 2 : 1;
   const shown = d.teams.filter(t => sel.has(t.rid));
-  const W = 820, H = 300, L = 44, R = 12, T = 10, B = 28;
+  const W = 820, H = 300, L = 44, R = 46, T = 10, B = 28;
   const all = shown.flatMap(t => t.series);
   const x0 = Math.min(...d.teams.flatMap(t => [t.series[0][0]])), x1 = Math.max(...d.teams.flatMap(t => [t.series[t.series.length-1][0]]));
   const ys = all.map(p => p[idx]);
