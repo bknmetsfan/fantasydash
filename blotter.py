@@ -48,6 +48,8 @@ CONFIG = {
     # waiver view treats their players as the incoming pool and drops them
     # from next week's field. league_id -> owner display name. Clear weekly.
     "pending_chop": {},          # e.g. {"1389721132256473088": "kickersvingames"}
+    # Default league for the waiver and chart sections.
+    "favorite_league": "1400335104223485952",   # Paris in 1795v2
     "shared_leagues": [
         "1400335104223485952",   # Paris in 1795v2
         "1389721132256473088",   # Degenerates
@@ -1341,7 +1343,7 @@ def build():
         lg.pop("_log", None)
 
     return {"week": week, "leagues": out_leagues, "book": book, "feed": feed,
-            "updated": time.strftime("%H:%M:%S")}
+            "favorite": CONFIG["favorite_league"], "updated": time.strftime("%H:%M:%S")}
 
 
 AUTH_COOKIE = "fd_auth"
@@ -1842,6 +1844,7 @@ PAGE = r"""<!doctype html>
 <script>
 const $ = s => document.querySelector(s);
 if (typeof LEAGUE_ID === 'undefined') window.LEAGUE_ID = null;
+let FAV = null;             // favourite league id, from the server
 const open = new Set();   // league ids with the drill-down expanded; survives re-render
 let showMinor = false;    // feed: show the full list instead of the last 12
 const collapsed = new Set((() => { try { return JSON.parse(localStorage.getItem('collapsed') || '[]'); } catch(e){ return []; } })());
@@ -1966,7 +1969,7 @@ let chartLeague = null;     // league_id shown in the chart section
 function chartSection(pools){
   pools = pools.filter(l => l.mode !== 'error');
   if (!pools.length) return '';
-  if (!chartLeague || !pools.some(l => l.league_id === chartLeague)) chartLeague = pools[0].league_id;
+  if (!chartLeague || !pools.some(l => l.league_id === chartLeague)) chartLeague = (pools.find(l => l.league_id === FAV) || pools[0]).league_id;
   const l = pools.find(x => x.league_id === chartLeague);
   if (collapsed.has('chart')) return section('chart', 'Chart', '');
   if (!histFresh(l.league_id)) loadHistory(l.league_id).then(() => tick());
@@ -1993,7 +1996,7 @@ async function loadWaivers(lid){
 }
 function waiverSection(pools){
   if (LEAGUE_ID || !pools.length) return '';
-  if (!waivLeague || !pools.some(l => l.league_id === waivLeague)) waivLeague = pools[0].league_id;
+  if (!waivLeague || !pools.some(l => l.league_id === waivLeague)) waivLeague = (pools.find(l => l.league_id === FAV) || pools[0]).league_id;
   if (collapsed.has('waivers')) return section('waivers', 'Waivers', '');
   const w = waiv[waivKey(waivLeague)];
   if (!(w && Date.now() - w.ts < 600000)) loadWaivers(waivLeague).then(() => tick());
@@ -2239,6 +2242,7 @@ async function tick(){
   catch(e){ $('#meta').textContent = 'offline'; return; }
   if (d.error){ $('#app').innerHTML = `<div class="err">${d.error}</div>`; return; }
   if (LEAGUE_ID) return leagueTick(d);
+  FAV = d.favorite;
 
   const pools = d.leagues.filter(l => l.mode === 'pool').sort((a,b) => a.survive_pct - b.survive_pct);
   const h2h   = d.leagues.filter(l => l.mode === 'h2h');
