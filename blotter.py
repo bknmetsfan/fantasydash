@@ -43,6 +43,11 @@ CONFIG = {
     "log_seconds": 60,           # min gap between calibration snapshots (0 = off)
     # Guillotine leagues whose /l/<id> page is open (no password) so
     # leaguemates can pick their own team and see the chop picture.
+    # Guillotine leagues with manual elimination (Sleeper's disable_elimination):
+    # name the team being chopped this week once the league decides, and the
+    # waiver view treats their players as the incoming pool and drops them
+    # from next week's field. league_id -> owner display name. Clear weekly.
+    "pending_chop": {},          # e.g. {"1389721132256473088": "kickersvingames"}
     "shared_leagues": [
         "1400335104223485952",   # Paris in 1795v2
         "1389721132256473088",   # Degenerates
@@ -1456,19 +1461,17 @@ def waiver_report(lid, as_rid=None):
     my_rid = mine["roster_id"]
     val = lambda p: proj_pts(p, projections, scoring) or 0.0
 
-    # Pending chop: last week's lowest scorer across ALL rosters. If Sleeper
-    # has already emptied that roster its players are plain free agents; if
-    # it still holds them (manual elimination) they're the chop pool, and the
-    # roster leaves next week's field.
+    # Pending chop (manual-elimination leagues only, from CONFIG): that
+    # roster's players are the incoming pool and it leaves next week's field.
+    # Leagues where Sleeper eliminates automatically need nothing: the roster
+    # is already emptied and its players are plain free agents.
     chop_pool, chop_name = set(), None
-    if week > 1:
-        prev = get(f"/league/{lid}/matchups/{week - 1}") or []
-        low = min((m for m in prev if (m.get("points") or 0) > 0), key=lambda m: m.get("points") or 0, default=None)
-        chopped = next((r for r in rosters if low and r["roster_id"] == low["roster_id"]), None)
-        if chopped and chopped["roster_id"] != my_rid:
-            chop_pool = set(chopped["players"])
-            chop_name = users.get(chopped.get("owner_id"), "?")
-            rosters = [r for r in rosters if r is not chopped]
+    want = CONFIG["pending_chop"].get(lid)
+    chopped = next((r for r in rosters if want and users.get(r.get("owner_id")) == want), None)
+    if chopped and chopped["roster_id"] != my_rid:
+        chop_pool = set(chopped["players"])
+        chop_name = want
+        rosters = [r for r in rosters if r is not chopped]
 
     def det_for(ids):
         lineup = best_lineup(ids, slots, val, players)
