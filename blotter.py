@@ -11,6 +11,7 @@ ESPN leagues go in espn.json (see espn.example.json; needs espn_s2 + SWID).
 
 import base64
 import hashlib
+import zlib
 import hmac
 import json
 import math
@@ -228,17 +229,18 @@ def simulate(teams, n):
     """
     teams: {rid: {pid: {"act","proj","rem","pos"}}} -> {rid: ndarray of n
     simulated finals}. Remaining points are gamma-distributed (right-skewed,
-    never negative). Fixed seed so refresh-to-refresh moves reflect data,
-    not sampling noise.
+    never negative). Each player's draws are seeded by his id, so the same
+    player gets the same luck in every scenario: refresh-to-refresh moves
+    and what-if comparisons reflect data, not sampling noise.
     """
-    rng = np.random.default_rng(7)
     out = {}
     for rid, det in teams.items():
         tot = np.full(n, sum(d["act"] for d in det.values()))
-        for d in det.values():
+        for pid, d in det.items():
             dist = player_dist(d)
             if dist:
                 mu, sd = dist
+                rng = np.random.default_rng(zlib.crc32(str(pid).encode()))
                 tot += rng.gamma((mu / sd) ** 2, sd * sd / mu, n)
         out[rid] = tot
     return out
@@ -1065,10 +1067,10 @@ def build():
             """
             actual = m.get("players_points") or {}
             val = lambda p: blended(p, actual, projections, scoring, players, games)
-            if best_ball:
+            ids = [p for p in (m.get("starters") or []) if p and p != "0"]
+            if best_ball or not ids:
+                # Best ball, or a lineup nobody has set yet: assume the optimal one.
                 ids = best_lineup(m.get("players") or [], lg.get("roster_positions") or [], val, players)
-            else:
-                ids = [p for p in (m.get("starters") or []) if p and p != "0"]
             det = {}
             for p in ids:
                 team = p if p in games else players.get(p, {}).get("team")
@@ -1395,6 +1397,111 @@ def api_league(lid):
 
 
 _roster_names = {}
+_waiver_cache = {}        # league_id -> (ts, report)
+WAIVER_POS = {"QB", "RB", "WR", "TE", "K", "DEF"}
+WAIVER_TOP = 12
+
+
+def waiver_report(lid):
+    """
+    Next-week view of a guillotine league, pregame: everyone on their
+    optimal lineup by projection. Positional holes (my starters vs the
+    field) and the marginal value of the top free agents: projected-final
+    delta, chop % before/after, who they'd displace.
+    """
+    c = _waiver_cache.get(lid)
+    if c and time.time() - c[0] < 600:
+        return c[1]
+    players = load_players()
+    week = (get("/state/nfl").get("week") or 1)
+    projections = load_projections(CONFIG["season"], week)
+    lg = get(f"/league/{lid}")
+    scoring = lg.get("scoring_settings") or {}
+    slots = lg.get("roster_positions") or []
+    users = {u["user_id"]: (u.get("display_name") or "?") for u in get(f"/league/{lid}/users")}
+    rosters = [r for r in get(f"/league/{lid}/rosters") if r.get("players")]
+    uid = get(f"/user/{CONFIG['sleeper_username']}")["user_id"]
+    mine = next((r for r in rosters if r.get("owner_id") == uid), None)
+    if mine is None:
+        return {"error": "no live roster in this league"}
+    my_rid = mine["roster_id"]
+    val = lambda p: proj_pts(p, projections, scoring) or 0.0
+
+    def det_for(ids):
+        lineup = best_lineup(ids, slots, val, players)
+        return {p: {"act": 0.0, "proj": val(p), "rem": 1.0, "pos": players.get(p, {}).get("pos", "")} for p in lineup}
+
+    dets = {r["roster_id"]: det_for(r["players"]) for r in rosters}
+    sims = simulate(dets, CONFIG["sims"])
+    rids = [r["roster_id"] for r in rosters]
+
+    def chop_pct(my_sims):
+        mat = np.array([my_sims if rid == my_rid else sims[rid] for rid in rids])
+        return round(100 * float(np.mean(mat.argmin(axis=0) == rids.index(my_rid))), 1)
+
+    my_det = dets[my_rid]
+    base = {"proj": round(sum(d["proj"] for d in my_det.values()), 2), "chop_pct": chop_pct(sims[my_rid])}
+
+    # Positional holes: my starters' projection by position vs every team's.
+    by_pos = {}
+    for rid, det in dets.items():
+        tot = {}
+        for d in det.values():
+            tot[d["pos"]] = tot.get(d["pos"], 0.0) + d["proj"]
+        for pos, v in tot.items():
+            by_pos.setdefault(pos, {})[rid] = v
+    holes = []
+    for pos in ("QB", "RB", "WR", "TE", "K", "DEF"):
+        if pos not in by_pos:
+            continue
+        vals = by_pos[pos]
+        me = vals.get(my_rid, 0.0)
+        ranked = sorted(vals.values(), reverse=True)
+        holes.append({"pos": pos, "mine": round(me, 2), "rank": ranked.index(me) + 1 if me in ranked else len(ranked),
+                      "of": len(ranked), "median": round(float(np.median(ranked)), 2),
+                      "best": round(ranked[0], 2), "gap": round(me - float(np.median(ranked)), 2),
+                      "n": sum(1 for d in my_det.values() if d["pos"] == pos)})
+
+    # Free agents: projected players nobody in the league rosters. Plus the
+    # "chop pool": last week's lowest scorer still holds their players until
+    # the commissioner drops them, so include those too, tagged.
+    rostered = {p for r in rosters for p in r["players"]}
+    chop_pool, chop_name = set(), None
+    if week > 1:
+        prev = get(f"/league/{lid}/matchups/{week - 1}") or []
+        alive = {r["roster_id"] for r in rosters}
+        low = min((m for m in prev if m["roster_id"] in alive and (m.get("points") or 0) > 0),
+                  key=lambda m: m.get("points") or 0, default=None)
+        if low and low["roster_id"] != my_rid:
+            chopped = next(r for r in rosters if r["roster_id"] == low["roster_id"])
+            chop_pool = set(chopped["players"])
+            chop_name = users.get(chopped.get("owner_id"), "?")
+            rostered -= chop_pool
+    fas = sorted((pid for pid in set(projections) | chop_pool if pid not in rostered
+                  and players.get(pid, {}).get("pos") in WAIVER_POS and players.get(pid, {}).get("team", "FA") != "FA"),
+                 key=lambda p: -val(p))[:WAIVER_TOP]
+    old_lineup = set(my_det)
+    cands = []
+    for pid in fas:
+        det2 = det_for(list(mine["players"]) + [pid])
+        s2 = simulate({my_rid: det2}, CONFIG["sims"])[my_rid]
+        proj2 = round(sum(d["proj"] for d in det2.values()), 2)
+        displaced = [players.get(p, {}).get("name", p) for p in old_lineup - set(det2)]
+        p = players.get(pid, {})
+        cands.append({"id": pid, "name": p.get("name", pid), "pos": p.get("pos", ""), "team": p.get("team", ""),
+                      "proj": round(val(pid), 2), "starts": pid in det2, "chop_pool": pid in chop_pool,
+                      "proj_after": proj2, "delta": round(proj2 - base["proj"], 2),
+                      "chop_after": chop_pct(s2), "displaces": displaced})
+    settings = lg.get("settings") or {}
+    report = {
+        "league_id": lid, "name": lg.get("name"), "week": week,
+        "faab": {"budget": settings.get("waiver_budget"), "used": (mine.get("settings") or {}).get("waiver_budget_used", 0)},
+        "field_size": len(rosters), "base": base, "holes": holes, "candidates": cands, "chop_name": chop_name,
+        "lineup": [{"name": players.get(p, {}).get("name", p), "pos": d["pos"], "proj": round(d["proj"], 2)}
+                   for p, d in my_det.items()],
+    }
+    _waiver_cache[lid] = (time.time(), report)
+    return report
 
 
 def roster_names(lid):
@@ -1478,6 +1585,14 @@ def api_history(lid):
              for rid, v in series.items()]
     teams.sort(key=lambda t: -t["series"][-1][2])
     return jsonify({"week": week, "weeks": weeks, "league_id": lid, "mode": (live or {}).get("mode"), "teams": teams})
+
+
+@app.route("/api/waivers/<lid>")
+def api_waivers(lid):
+    try:
+        return jsonify(waiver_report(lid))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
 
 
 @app.route("/l/<lid>")
@@ -1591,6 +1706,10 @@ PAGE = r"""<!doctype html>
   .fev .tags{padding-left:0;font-weight:400}
   .fev .fwhat{font-size:12.5px}
   .chartsec{background:var(--panel);padding:10px 14px 12px;border-left:3px solid var(--rule)}
+  .chartsec h3{font-size:12px;font-weight:600;color:var(--mute);margin:12px 0 6px}
+  .chartsec table{font-size:13px}
+  .chartsec td,.chartsec th{padding:3px 8px 3px 0}
+  tr.hole td{background:rgba(166,64,43,.07)}
   .chartwrap{margin:4px 0 14px}
   .chartbar{font-size:12.5px;margin-bottom:6px}
   .chartbar a{color:var(--mute);text-decoration:none}
@@ -1748,6 +1867,46 @@ function chartSection(pools){
     ${histFresh(l.league_id) ? historyChart(l, hist[l.league_id].data) : '<div class="pos">loading…</div>'}
   </div>`;
   return section('chart', 'Chart', body);
+}
+
+// ---- waivers (main page only) ----
+const waiv = {};            // league_id -> {ts, data}
+let waivLeague = null;
+async function loadWaivers(lid){
+  const w = waiv[lid];
+  if (w && Date.now() - w.ts < 600000) return w.data;
+  try { const d = await (await fetch(`/api/waivers/${lid}`)).json(); waiv[lid] = {ts: Date.now(), data: d}; return d; }
+  catch(e){ return null; }
+}
+function waiverSection(pools){
+  if (LEAGUE_ID || !pools.length) return '';
+  if (!waivLeague || !pools.some(l => l.league_id === waivLeague)) waivLeague = pools[0].league_id;
+  if (collapsed.has('waivers')) return section('waivers', 'Waivers', '');
+  const w = waiv[waivLeague];
+  if (!(w && Date.now() - w.ts < 600000)) loadWaivers(waivLeague).then(() => tick());
+  const picker = `<select onchange="waivLeague=this.value;tick()">${pools.map(x => `<option value="${x.league_id}" ${x.league_id === waivLeague ? 'selected' : ''}>${x.name}</option>`).join('')}</select>`;
+  let body = `<div class="pick" style="margin-bottom:8px">League &nbsp;${picker}</div>`;
+  if (!w) body += '<div class="pos">computing…</div>';
+  else if (w.data.error) body += `<div class="err">${w.data.error}</div>`;
+  else {
+    const d = w.data, sgn = x => x > 0 ? 'long' : (x < 0 ? 'short' : 'pos');
+    body += `<div class="pos num" style="margin-bottom:10px">week ${d.week} · everyone on optimal lineups · you proj <b>${f2(d.base.proj)}</b>, chop <b class="${d.base.chop_pct >= 15 ? 'short' : ''}">${d.base.chop_pct}%</b>${d.faab.budget ? ` · FAAB left <b>${d.faab.budget - d.faab.used}</b> of ${d.faab.budget}` : ''}</div>`;
+    body += `<h3>Holes · your starters by position vs the field</h3>
+      <table><tr><th>Pos</th><th class="r">Slots</th><th class="r">Yours</th><th class="r">Rank</th><th class="r">Median</th><th class="r">Best</th><th class="r">vs median</th></tr>
+      ${d.holes.map(h => `<tr class="${h.rank > d.field_size * 0.67 ? 'hole' : ''}"><td>${h.pos}</td><td class="r num">${h.n}</td><td class="r num">${f2(h.mine)}</td>
+        <td class="r num ${h.rank > d.field_size * 0.67 ? 'short' : (h.rank <= 3 ? 'long' : '')}">${h.rank}/${h.of}</td>
+        <td class="r num pos">${f2(h.median)}</td><td class="r num pos">${f2(h.best)}</td>
+        <td class="r num ${sgn(h.gap)}">${h.gap > 0 ? '+' : ''}${f2(h.gap)}</td></tr>`).join('')}</table>`;
+    body += `<h3>Top free agents · what adding each does to next week${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''}</h3>
+      <table><tr><th>Player</th><th class="r">Proj</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th></tr>
+      ${d.candidates.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
+        <td>${c.name} <span class="pos">${c.pos} ${c.team}</span>${c.chop_pool ? ` <span class="short" style="font-size:11px">chop pool</span>` : ''}</td>
+        <td class="r num">${f2(c.proj)}</td><td class="r num">${f2(c.proj_after)}</td>
+        <td class="r num ${sgn(c.delta)}">${c.delta > 0 ? '+' : ''}${f2(c.delta)}</td>
+        <td class="r num ${c.chop_after < d.base.chop_pct ? 'long' : 'pos'}">${c.chop_after}%<span class="pos" style="font-size:11px"> (${(c.chop_after - d.base.chop_pct) > 0 ? '+' : ''}${(c.chop_after - d.base.chop_pct).toFixed(1)})</span></td>
+        <td class="pos" style="font-size:12.5px">${c.starts ? (c.displaces.join(', ') || '—') : 'bench'}</td></tr>`).join('')}</table>`;
+  }
+  return section('waivers', 'Waivers', `<div class="chartsec">${body}</div>`);
 }
 
 function poolDetail(l){
@@ -1962,6 +2121,7 @@ async function tick(){
     <tr><th>Player</th><th class="r">Pts</th><th class="r">Proj final</th><th class="r" title="root x remaining projection: swing still on the table">Impact</th><th class="r" title="pp of survival/win per fantasy point, summed over leagues">Root /pt</th><th>Leagues</th></tr>
     ${bookRows(d.book)}</table>`;
   html += section('book', 'Exposure', bookHtml, d.book.length);
+  html += waiverSection(pools);
   html += chartSection(d.leagues);
   if (manual.length){
     const bad = manual.flatMap(m => m.unmatched);
