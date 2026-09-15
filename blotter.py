@@ -1394,11 +1394,12 @@ def api_history(lid):
     for ts, rid, pts, proj in rows:
         series.setdefault(rid, []).append([ts, pts, proj])
     # Trim the trailing flat run (post-game snapshots) so the axis ends when
-    # the last score moved, keeping one point past it.
+    # the last live score moved, keeping one point past it. Projections keep
+    # drifting after the games (Sleeper revises them), so key on points only.
     snaps = sorted({ts for ts, *_ in rows})
     by_ts = {}
     for ts, rid, pts, proj in rows:
-        by_ts.setdefault(ts, {})[rid] = (pts, proj)
+        by_ts.setdefault(ts, {})[rid] = pts
     last_change = snaps[0] if snaps else 0
     for a, b in zip(snaps, snaps[1:]):
         if by_ts[a] != by_ts[b]:
