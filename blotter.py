@@ -1423,6 +1423,8 @@ def api_history(lid):
     if week is None:
         week = (con.execute("SELECT MAX(week) FROM players WHERE season=? AND league_id=?", (season, lid)).fetchone()[0]
                 or (_cache["data"] or {}).get("week") or 1)
+    weeks = [w for (w,) in con.execute("SELECT DISTINCT week FROM players WHERE season=? AND league_id=? ORDER BY week",
+                                       (season, lid)).fetchall()]
     rows = con.execute(
         "SELECT ts, rid, ROUND(SUM(act), 2), ROUND(SUM(act + proj * rem), 2) FROM players "
         "WHERE season=? AND week=? AND league_id=? GROUP BY ts, rid ORDER BY ts", (season, week, lid)).fetchall()
@@ -1442,6 +1444,11 @@ def api_history(lid):
         con.close()
         names.update({rid: fetched[rid] for rid in missing if rid in fetched})
     live = next((l for l in (_cache["data"] or {}).get("leagues", []) if l["league_id"] == lid), None)
+    for t in (live or {}).get("field") or []:
+        names.setdefault(str(t["rid"]), t["name"])
+    for t in (live or {}).get("standings") or []:
+        names.setdefault(str(t["rid"]), t["name"])
+    names.setdefault("me", "you")
     series = {}
     for ts, rid, pts, proj in rows:
         series.setdefault(rid, []).append([ts, pts, proj])
@@ -1464,11 +1471,13 @@ def api_history(lid):
     series = {rid: [pt for pt in v if pt[0] in keep_set] for rid, v in series.items()}
     step = max(1, max((len(v) for v in series.values()), default=1) // 400)
     my_rid = str((live or {}).get("my_rid", ""))
-    teams = [{"rid": rid, "name": names.get(rid, f"Roster {rid}"), "me": rid == my_rid,
+    opp = (live or {}).get("opp_name")
+    teams = [{"rid": rid, "name": names.get(rid, f"Roster {rid}"), "me": rid == my_rid or rid == "me",
+              "opp": names.get(rid) == opp,
               "series": v[::step] + ([v[-1]] if (len(v) - 1) % step else [])}
              for rid, v in series.items()]
     teams.sort(key=lambda t: -t["series"][-1][2])
-    return jsonify({"week": week, "league_id": lid, "teams": teams})
+    return jsonify({"week": week, "weeks": weeks, "league_id": lid, "mode": (live or {}).get("mode"), "teams": teams})
 
 
 @app.route("/l/<lid>")
@@ -1585,6 +1594,7 @@ PAGE = r"""<!doctype html>
   .chartwrap{margin:4px 0 14px}
   .chartbar{font-size:12.5px;margin-bottom:6px}
   .chartbar a{color:var(--mute);text-decoration:none}
+  .chartbar select{font:inherit;font-size:12.5px;padding:2px 4px;border:1px solid var(--rule);background:var(--panel);color:var(--ink)}
   .chartbar a.on{color:var(--ink);font-weight:600;text-decoration:underline}
   .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;margin-top:6px}
   .lg-item{cursor:pointer;white-space:nowrap}
@@ -1670,9 +1680,10 @@ function chartToggleTeam(lid, rid){
 function historyChart(l, d){
   if (!d || !d.teams.length) return '<div class="pos">No history logged for this week yet.</div>';
   if (!chartSel[l.league_id]){
-    // Default: you, the projected chop line, and the two teams above it.
-    const bottom = [...d.teams].slice(-3).map(t => t.rid);
-    chartSel[l.league_id] = new Set([...bottom, ...d.teams.filter(t => t.me).map(t => t.rid)]);
+    // Default: pools -> you, the projected chop line and the two above it;
+    // head-to-head -> you and this week's opponent; solo -> you.
+    const bottom = d.mode === 'pool' ? [...d.teams].slice(-3).map(t => t.rid) : [];
+    chartSel[l.league_id] = new Set([...bottom, ...d.teams.filter(t => t.me || t.opp).map(t => t.rid)]);
   }
   const sel = chartSel[l.league_id];
   const idx = chartMode === 'proj' ? 2 : 1;
@@ -1712,7 +1723,7 @@ function historyChart(l, d){
   const legend = d.teams.map(t => { const col = PALETTE[d.teams.indexOf(t) % PALETTE.length], on = sel.has(t.rid);
     return `<label class="lg-item" style="opacity:${on ? 1 : .45}"><input type="checkbox" ${on ? 'checked' : ''} onclick="event.stopPropagation();chartToggleTeam('${l.league_id}','${t.rid}')"> <span style="color:${col}">■</span> ${t.name}${t.me ? ' (you)' : ''}</label>`; }).join('');
   return `<div class="chartwrap" onclick="event.stopPropagation()">
-    <div class="chartbar"><span class="pos"><a href="#" onclick="chartSetWeek('${l.league_id}',${d.week-1});return false">‹</a> week ${d.week} ${d.week < l.week ? `<a href="#" onclick="chartSetWeek('${l.league_id}',${d.week+1});return false">›</a>` : ''} · </span>
+    <div class="chartbar"><span class="pos">week <select onchange="chartSetWeek('${l.league_id}',+this.value)">${(d.weeks || [d.week]).map(w => `<option value="${w}" ${w === d.week ? 'selected' : ''}>${w}</option>`).join('')}</select> · </span>
       <a href="#" class="${chartMode === 'proj' ? 'on' : ''}" onclick="chartMode='proj';tick();return false">projected final</a> ·
       <a href="#" class="${chartMode === 'pts' ? 'on' : ''}" onclick="chartMode='pts';tick();return false">live points</a>
       <span class="pos"> · <a href="#" onclick="chartSel['${l.league_id}']=new Set(${JSON.stringify(d.teams.map(t=>t.rid))});tick();return false">all</a> · <a href="#" onclick="chartSel['${l.league_id}']=new Set();tick();return false">none</a></span></div>
@@ -1723,6 +1734,7 @@ function historyChart(l, d){
 
 let chartLeague = null;     // league_id shown in the chart section
 function chartSection(pools){
+  pools = pools.filter(l => l.mode !== 'error');
   if (!pools.length) return '';
   if (!chartLeague || !pools.some(l => l.league_id === chartLeague)) chartLeague = pools[0].league_id;
   const l = pools.find(x => x.league_id === chartLeague);
@@ -1950,7 +1962,7 @@ async function tick(){
     <tr><th>Player</th><th class="r">Pts</th><th class="r">Proj final</th><th class="r" title="root x remaining projection: swing still on the table">Impact</th><th class="r" title="pp of survival/win per fantasy point, summed over leagues">Root /pt</th><th>Leagues</th></tr>
     ${bookRows(d.book)}</table>`;
   html += section('book', 'Exposure', bookHtml, d.book.length);
-  html += chartSection(pools);
+  html += chartSection(d.leagues);
   if (manual.length){
     const bad = manual.flatMap(m => m.unmatched);
     if (bad.length) html += `<div class="err">Unmatched names in manual.json: ${bad.join(', ')}. Fix the spelling to fold them into exposure.</div>`;
