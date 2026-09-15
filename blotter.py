@@ -1424,13 +1424,16 @@ def api_history(lid):
     by_ts = {}
     for ts, rid, pts, proj in rows:
         by_ts.setdefault(ts, {})[rid] = pts
-    last_change = snaps[0] if snaps else 0
-    for a, b in zip(snaps, snaps[1:]):
-        if by_ts[a] != by_ts[b]:
-            last_change = b
-    cut = next((t for t in snaps if t > last_change), None)
-    if cut is not None:
-        series = {rid: [pt for pt in v if pt[0] <= cut] for rid, v in series.items()}
+    # Keep only "action" snapshots: the first, and any where some team's live
+    # points moved since the previous kept one. Dead time between games
+    # (where only projections twitch) drops out entirely.
+    keep, prev = [], None
+    for t in snaps:
+        if prev is None or by_ts[t] != by_ts[prev]:
+            keep.append(t)
+            prev = t
+    keep_set = set(keep)
+    series = {rid: [pt for pt in v if pt[0] in keep_set] for rid, v in series.items()}
     step = max(1, max((len(v) for v in series.values()), default=1) // 400)
     my_rid = str((live or {}).get("my_rid", ""))
     teams = [{"rid": rid, "name": names.get(rid, f"Roster {rid}"), "me": rid == my_rid,
@@ -1647,25 +1650,32 @@ function historyChart(l, d){
   const shown = d.teams.filter(t => sel.has(t.rid));
   const W = 820, H = 300, L = 44, R = 46, T = 10, B = 28;
   const all = shown.flatMap(t => t.series);
-  const x0 = Math.min(...d.teams.flatMap(t => [t.series[0][0]])), x1 = Math.max(...d.teams.flatMap(t => [t.series[t.series.length-1][0]]));
+  // Even spacing per snapshot ("game time"): dead time is already dropped
+  // server-side, and real-time jumps > 30 min get a dotted marker.
+  const times = [...new Set(d.teams.flatMap(t => t.series.map(p => p[0])))].sort((a, b) => a - b);
+  const xi = new Map(times.map((t, i) => [t, i]));
+  const x0 = 0, x1 = Math.max(1, times.length - 1);
   const ys = all.map(p => p[idx]);
   let y0 = Math.min(...ys, chartMode === 'pts' ? 0 : Infinity), y1 = Math.max(...ys);
   if (!isFinite(y0) || !isFinite(y1)) return '<div class="pos">Pick a team to plot.</div>';
   if (y1 - y0 < 10) y1 = y0 + 10;
   const pad = (y1 - y0) * 0.05; y0 -= pad; y1 += pad;
-  const X = t => L + (t - x0) / Math.max(1, x1 - x0) * (W - L - R);
+  const X = t => L + ((xi.get(t) ?? 0) - x0) / Math.max(1, x1 - x0) * (W - L - R);
   const Y = v => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
   const hh = t => { const dt = new Date(t * 1000); return dt.getHours() + ':' + String(dt.getMinutes()).padStart(2, '0'); };
-  // axes: 5 y ticks, x ticks every ~2h
+  // axes: 5 y ticks; ~8 time labels; dotted markers where real time jumps
   let g = '';
   for (let i = 0; i <= 4; i++){ const v = y0 + (y1 - y0) * i / 4; g += `<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--rule)"/><text x="${L-6}" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--mute)">${v.toFixed(0)}</text>`; }
-  const span = x1 - x0, stepH = span > 8*3600 ? 2 : 1;
-  for (let t = Math.ceil(x0 / 3600) * 3600; t <= x1; t += stepH * 3600) g += `<text x="${X(t)}" y="${H-8}" text-anchor="middle" font-size="11" fill="var(--mute)">${hh(t)}</text>`;
-  // lines: break where the log has a gap > 20 min
+  const every = Math.max(1, Math.round(times.length / 8));
+  const dayOf = t => new Date(t * 1000).toLocaleDateString(undefined, {weekday: 'short'});
+  times.forEach((t, i) => {
+    if (i % every === 0 || i === times.length - 1) g += `<text x="${X(t)}" y="${H-8}" text-anchor="middle" font-size="11" fill="var(--mute)">${hh(t)}</text>`;
+    if (i > 0 && t - times[i-1] > 1800) g += `<line x1="${X(t)}" x2="${X(t)}" y1="${T}" y2="${H-B}" stroke="var(--mute)" stroke-dasharray="2,4" opacity=".6"/><text x="${X(t)+3}" y="${T+10}" font-size="10" fill="var(--mute)">${dayOf(t)} ${hh(t)}</text>`;
+  });
   const lines = shown.map(t => {
     const col = PALETTE[d.teams.indexOf(t) % PALETTE.length];
     let path = '', prev = null;
-    for (const p of t.series){ path += (prev === null || p[0] - prev > 1200 ? 'M' : 'L') + `${X(p[0]).toFixed(1)},${Y(p[idx]).toFixed(1)} `; prev = p[0]; }
+    for (const p of t.series){ path += (prev === null || p[0] - prev > 1800 ? 'M' : 'L') + `${X(p[0]).toFixed(1)},${Y(p[idx]).toFixed(1)} `; prev = p[0]; }
     const last = t.series[t.series.length - 1];
     return `<path d="${path}" fill="none" stroke="${col}" stroke-width="${t.me ? 2.5 : 1.5}" ${t.me ? '' : 'opacity=".85"'}/>
       <text x="${X(last[0]) + 4}" y="${Y(last[idx]) + 4}" font-size="11" fill="${col}">${last[idx].toFixed(1)}</text>`;
