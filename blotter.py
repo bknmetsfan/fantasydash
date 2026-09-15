@@ -1477,6 +1477,21 @@ def waiver_report(lid, as_rid=None):
         lineup = best_lineup(ids, slots, val, players)
         return {p: {"act": 0.0, "proj": val(p), "rem": 1.0, "pos": players.get(p, {}).get("pos", "")} for p in lineup}
 
+    def slot_labels(assigned):
+        """[(slot, pid)] -> [('RB1', pid), ('RB2', pid), ('FLEX', pid), ...]"""
+        counts = {}
+        for sl, _ in assigned:
+            counts[sl] = counts.get(sl, 0) + 1
+        seen, out = {}, []
+        for sl, pid in assigned:
+            seen[sl] = seen.get(sl, 0) + 1
+            label = sl.replace("SUPER_FLEX", "SF")
+            out.append((f"{label}{seen[sl]}" if counts[sl] > 1 else label, pid))
+        return out
+
+    by_slot = {r["roster_id"]: slot_labels(best_lineup_slots(r["players"], slots, val, players)) for r in rosters}
+    slot_order = [lbl for lbl, _ in next(iter(by_slot.values()), [])]
+
     dets = {r["roster_id"]: det_for(r["players"]) for r in rosters}
     sims = simulate(dets, CONFIG["sims"])
     rids = [r["roster_id"] for r in rosters]
@@ -1494,34 +1509,27 @@ def waiver_report(lid, as_rid=None):
     field = []
     for rid, r in zip(rids, rosters):
         det = dets[rid]
-        split = {}
-        for d in det.values():
-            split[d["pos"]] = round(split.get(d["pos"], 0.0) + d["proj"], 2)
+        split = {lbl: round(val(pid), 2) for lbl, pid in by_slot[rid]}
         field.append({"rid": rid, "name": users.get(r.get("owner_id"), f"Roster {rid}"),
                       "proj": round(sum(d["proj"] for d in det.values()), 2),
                       "chop_pct": round(100 * float(chop_all[rids.index(rid)]), 1),
                       "split": split, "me": rid == my_rid})
     field.sort(key=lambda f: -f["proj"])
 
-    # Positional holes: my starters' projection by position vs every team's.
-    by_pos = {}
-    for rid, det in dets.items():
-        tot = {}
-        for d in det.values():
-            tot[d["pos"]] = tot.get(d["pos"], 0.0) + d["proj"]
-        for pos, v in tot.items():
-            by_pos.setdefault(pos, {})[rid] = v
+    # Holes by lineup slot: my starter in each slot vs everyone's starter in
+    # that slot (RB1 vs the field's RB1s, FLEX vs FLEXes, ...).
     holes = []
-    for pos in ("QB", "RB", "WR", "TE", "K", "DEF"):
-        if pos not in by_pos:
+    for lbl in slot_order:
+        vals = {rid: val(pid) for rid, pairs in by_slot.items() for l2, pid in pairs if l2 == lbl}
+        if my_rid not in vals:
             continue
-        vals = by_pos[pos]
-        me = vals.get(my_rid, 0.0)
+        me = vals[my_rid]
+        my_pid = next(pid for l2, pid in by_slot[my_rid] if l2 == lbl)
         ranked = sorted(vals.values(), reverse=True)
-        holes.append({"pos": pos, "mine": round(me, 2), "rank": ranked.index(me) + 1 if me in ranked else len(ranked),
+        holes.append({"pos": lbl, "who": players.get(my_pid, {}).get("name", my_pid),
+                      "mine": round(me, 2), "rank": ranked.index(me) + 1,
                       "of": len(ranked), "median": round(float(np.median(ranked)), 2),
-                      "best": round(ranked[0], 2), "gap": round(me - float(np.median(ranked)), 2),
-                      "n": sum(1 for d in my_det.values() if d["pos"] == pos)})
+                      "best": round(ranked[0], 2), "gap": round(me - float(np.median(ranked)), 2)})
 
     # Free agents: projected players nobody in the (surviving) league rosters,
     # plus the pending chop pool identified above.
@@ -1572,6 +1580,7 @@ def waiver_report(lid, as_rid=None):
         "field": field,
         "faab": {"budget": settings.get("waiver_budget"), "used": (mine.get("settings") or {}).get("waiver_budget_used", 0)},
         "field_size": len(rosters), "base": base, "holes": holes, "candidates": cands, "chop_name": chop_name,
+        "slot_order": slot_order,
         "lineup": lineup_rows_out, "set_not_optimal": not_optimal, "lineup_set": bool(set_now),
     }
     _waiver_cache[(lid, as_rid)] = (time.time(), report)
@@ -1972,8 +1981,8 @@ function waiverSection(pools){
     const d = w.data, sgn = x => x > 0 ? 'long' : (x < 0 ? 'short' : 'pos');
     const who = d.as.is_me ? 'you' : `<b class="warnc">${d.as.name}</b>`;
     body += `<div class="pos num" style="margin-bottom:10px">week ${d.week} · everyone on optimal lineups · ${who} proj <b>${f2(d.base.proj)}</b>, chop <b class="${d.base.chop_pct >= 15 ? 'short' : ''}">${d.base.chop_pct}%</b>${d.faab.budget ? ` · FAAB left <b>${d.faab.budget - d.faab.used}</b> of ${d.faab.budget}` : ''}</div>`;
-    const posCols = [...new Set(d.field.flatMap(f => Object.keys(f.split)))].sort((a,b) => ['QB','RB','WR','TE','K','DEF'].indexOf(a) - ['QB','RB','WR','TE','K','DEF'].indexOf(b));
-    body += `<h3>Field · everyone's optimal lineup by projection, with the split by position</h3>
+    const posCols = d.slot_order || [];
+    body += `<h3>Field · everyone's optimal lineup by projection, by slot</h3>
       <table><tr><th class="rk">#</th><th>Team</th><th class="r">Proj</th><th class="r">Chop %</th>${posCols.map(c => `<th class="r">${c}</th>`).join('')}</tr>
       ${d.field.map((f, i) => `<tr class="${f.me ? 'me' : ''} ${i === d.field.length - 2 ? 'line' : ''}">
         <td class="rk num">${i+1}</td><td>${f.name}${f.me ? (d.as.is_me ? ' <span class="pos">(you)</span>' : ' <span class="warnc">(as)</span>') : ''}</td>
@@ -1988,9 +1997,9 @@ function waiverSection(pools){
         <td>${r.name} <span class="pos">${r.pos} ${r.team}</span>${inj(r.inj)}${r.set ? ' <span class="long">✓</span>' : (d.lineup_set ? ' <span class="short">not set</span>' : '')}</td>
         <td class="r num">${f2(r.proj)}</td>
         <td class="pos" style="padding-left:18px;font-size:12.5px">${r.alts.map(a => `${a.name}${inj(a.inj)} <span class="num">${a.proj.toFixed(1)}</span> <span class="num ${gapCls(a.gap)}">(${a.gap > 0 ? '+' : ''}${a.gap.toFixed(1)})</span>${a.set ? ' <span class="short">set</span>' : ''}`).join(' · ') || '—'}</td></tr>`).join('')}</table>`;
-    body += `<h3>Holes · ${d.as.is_me ? 'your' : 'their'} starters by position vs the field</h3>
-      <table><tr><th>Pos</th><th class="r">Slots</th><th class="r">Yours</th><th class="r">Rank</th><th class="r">Median</th><th class="r">Best</th><th class="r">vs median</th></tr>
-      ${d.holes.map(h => `<tr class="${h.rank > d.field_size * 0.67 ? 'hole' : ''}"><td>${h.pos}</td><td class="r num">${h.n}</td><td class="r num">${f2(h.mine)}</td>
+    body += `<h3>Holes · ${d.as.is_me ? 'your' : 'their'} starter in each slot vs the field's</h3>
+      <table><tr><th>Slot</th><th>Starter</th><th class="r">Proj</th><th class="r">Rank</th><th class="r">Median</th><th class="r">Best</th><th class="r">vs median</th></tr>
+      ${d.holes.map(h => `<tr class="${h.rank > d.field_size * 0.67 ? 'hole' : ''}"><td class="pos">${h.pos}</td><td>${h.who}</td><td class="r num">${f2(h.mine)}</td>
         <td class="r num ${h.rank > d.field_size * 0.67 ? 'short' : (h.rank <= 3 ? 'long' : '')}">${h.rank}/${h.of}</td>
         <td class="r num pos">${f2(h.median)}</td><td class="r num pos">${f2(h.best)}</td>
         <td class="r num ${sgn(h.gap)}">${h.gap > 0 ? '+' : ''}${f2(h.gap)}</td></tr>`).join('')}</table>`;
