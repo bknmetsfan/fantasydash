@@ -1542,6 +1542,13 @@ def waiver_report(lid, as_rid=None):
                   and players.get(pid, {}).get("pos") in usable and players.get(pid, {}).get("team", "FA") != "FA"),
                  key=lambda p: -val(p))[:WAIVER_TOP]
     old_lineup = set(my_det)
+    base_proj = {rid: sum(d["proj"] for d in det.values()) for rid, det in dets.items()}
+    base_chop = {rid: 100 * float(chop_all[rids.index(rid)]) for rid in rids}
+
+    def chop_pct_for(rid, team_sims):
+        mat = np.array([team_sims if r == rid else sims[r] for r in rids])
+        return 100 * float(np.mean(mat.argmin(axis=0) == rids.index(rid)))
+
     cands = []
     for pid in fas:
         det2 = det_for(list(mine["players"]) + [pid])
@@ -1549,10 +1556,26 @@ def waiver_report(lid, as_rid=None):
         proj2 = round(sum(d["proj"] for d in det2.values()), 2)
         displaced = [players.get(p, {}).get("name", p) for p in old_lineup - set(det2)]
         p = players.get(pid, {})
+        # Demand: the same add from every other seat. Who would start him,
+        # and who gains the most chop safety from him.
+        wants = []
+        for r in rosters:
+            rid = r["roster_id"]
+            if rid == my_rid:
+                continue
+            d_other = det_for(list(r["players"]) + [pid])
+            if pid not in d_other:
+                continue
+            gain = sum(d["proj"] for d in d_other.values()) - base_proj[rid]
+            swing = chop_pct_for(rid, simulate({rid: d_other}, CONFIG["sims"])[rid]) - base_chop[rid]
+            wants.append({"name": users.get(r.get("owner_id"), f"Roster {rid}"), "delta": round(gain, 2),
+                          "chop_swing": round(swing, 1), "faab": budget - ((r.get("settings") or {}).get("waiver_budget_used") or 0)})
+        wants.sort(key=lambda w: w["chop_swing"])
         cands.append({"id": pid, "name": p.get("name", pid), "pos": p.get("pos", ""), "team": p.get("team", ""),
                       "proj": round(val(pid), 2), "starts": pid in det2, "chop_pool": pid in chop_pool,
                       "proj_after": proj2, "delta": round(proj2 - base["proj"], 2),
-                      "chop_after": chop_pct(s2), "displaces": displaced})
+                      "chop_after": chop_pct(s2), "displaces": displaced,
+                      "demand": {"starts": len(wants), "of": len(rosters) - 1, "top": wants[:3]}})
     # My lineup by slot, what's actually set on Sleeper, and the best bench
     # alternatives per slot so close calls are visible.
     assigned = best_lineup_slots(mine["players"], slots, val, players)
@@ -2007,13 +2030,14 @@ function waiverSection(pools){
         <td class="r num pos">${f2(h.median)}</td><td class="r num pos">${f2(h.best)}</td>
         <td class="r num ${sgn(h.gap)}">${h.gap > 0 ? '+' : ''}${f2(h.gap)}</td></tr>`).join('')}</table>`;
     body += `<h3>Top free agents · what adding each does to next week${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''}</h3>
-      <table><tr><th>Player</th><th class="r">Proj</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th></tr>
+      <table><tr><th>Player</th><th class="r">Proj</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
       ${d.candidates.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
         <td>${c.name} <span class="pos">${c.pos} ${c.team}</span>${c.chop_pool ? ` <span class="short" style="font-size:11px">chop pool</span>` : ''}</td>
         <td class="r num">${f2(c.proj)}</td><td class="r num">${f2(c.proj_after)}</td>
         <td class="r num ${sgn(c.delta)}">${c.delta > 0 ? '+' : ''}${f2(c.delta)}</td>
         <td class="r num ${c.chop_after < d.base.chop_pct ? 'long' : 'pos'}">${c.chop_after}%<span class="pos" style="font-size:11px"> (${(c.chop_after - d.base.chop_pct) > 0 ? '+' : ''}${(c.chop_after - d.base.chop_pct).toFixed(1)})</span></td>
-        <td class="pos" style="font-size:12.5px">${c.starts ? (c.displaces.join(', ') || '—') : 'bench'}</td></tr>`).join('')}</table>`;
+        <td class="pos" style="font-size:12.5px">${c.starts ? (c.displaces.join(', ') || '—') : 'bench'}</td>
+        <td class="pos" style="font-size:12.5px;padding-left:14px"><b class="${c.demand.starts >= c.demand.of / 2 ? 'short' : ''}">${c.demand.starts}/${c.demand.of}</b>${c.demand.top.length ? ' · ' + c.demand.top.map(w => `${w.name} <span class="num">${w.chop_swing.toFixed(1)}%</span>`).join(', ') : ''}</td></tr>`).join('')}</table>`;
   }
   return section('waivers', 'Waivers', `<div class="chartsec">${body}</div>`);
 }
