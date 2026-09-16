@@ -1434,7 +1434,14 @@ def api_league(lid):
 _roster_names = {}
 _waiver_cache = {}        # league_id -> (ts, report)
 WAIVER_POS = {"QB", "RB", "WR", "TE", "K", "DEF"}
-WAIVER_TOP = 12
+WAIVER_TOP = 12           # rows shown
+WAIVER_LOG = 30           # free agents snapshotted for the bids database
+_bids_last = {}           # league_id -> ts of last transactions sync
+
+
+def tier_of(frac):
+    """Free-agent tier from the share of teams he'd start for."""
+    return 1 if frac >= 0.75 else (2 if frac >= 0.33 else 3)
 
 
 def waiver_report(lid, as_rid=None):
@@ -1542,7 +1549,12 @@ def waiver_report(lid, as_rid=None):
     usable = set().union(*(ELIGIBLE.get(sl, {sl}) for sl in slots if sl not in NON_SLOTS)) & WAIVER_POS
     fas = sorted((pid for pid in set(projections) | chop_pool if pid not in rostered
                   and players.get(pid, {}).get("pos") in usable and players.get(pid, {}).get("team", "FA") != "FA"),
-                 key=lambda p: -val(p))[:WAIVER_TOP]
+                 key=lambda p: -val(p))[:WAIVER_LOG]
+    # Positional rank among everyone (rostered + FA) with a projection.
+    pos_rank = {}
+    for pos in usable:
+        ranked = sorted((pid for pid in projections if players.get(pid, {}).get("pos") == pos), key=lambda p: -val(p))
+        pos_rank.update({pid: i + 1 for i, pid in enumerate(ranked)})
     old_lineup = set(my_det)
     base_proj = {rid: sum(d["proj"] for d in det.values()) for rid, det in dets.items()}
     base_chop = {rid: 100 * float(chop_all[rids.index(rid)]) for rid in rids}
@@ -1573,8 +1585,12 @@ def waiver_report(lid, as_rid=None):
             wants.append({"name": users.get(r.get("owner_id"), f"Roster {rid}"), "delta": round(gain, 2),
                           "chop_swing": round(swing, 1), "faab": budget - ((r.get("settings") or {}).get("waiver_budget_used") or 0)})
         wants.sort(key=lambda w: w["chop_swing"])
+        frac = len(wants) / max(1, len(rosters) - 1)
         cands.append({"id": pid, "name": p.get("name", pid), "pos": p.get("pos", ""), "team": p.get("team", ""),
                       "proj": round(val(pid), 2), "starts": pid in det2, "chop_pool": pid in chop_pool,
+                      "pos_rank": pos_rank.get(pid), "tier": tier_of(frac),
+                      "max_delta": round(max((w["delta"] for w in wants), default=0.0), 2),
+                      "max_swing": round(min((w["chop_swing"] for w in wants), default=0.0), 1),
                       "proj_after": proj2, "delta": round(proj2 - base["proj"], 2),
                       "chop_after": chop_pct(s2), "displaces": displaced,
                       "demand": {"starts": len(wants), "of": len(rosters) - 1, "top": wants[:3]}})
@@ -1610,8 +1626,181 @@ def waiver_report(lid, as_rid=None):
         "slot_order": slot_order,
         "lineup": lineup_rows_out, "set_not_optimal": not_optimal, "lineup_set": bool(set_now),
     }
+    report["candidates_all"] = cands            # for logging; UI shows WAIVER_TOP
+    report["candidates"] = cands[:WAIVER_TOP]
     _waiver_cache[(lid, as_rid)] = (time.time(), report)
+    if as_rid is None:
+        log_fa_snapshot(report, len(rosters), users, rosters, budget)
+        sync_bids(lid, week, users, rosters, budget)
     return report
+
+
+# ----------------------------------------------------------------------------
+# Bids database: the pre-bid board (fa_snapshots) and every claim, won or
+# lost, joined to that board (bids). Field size is the season's time axis.
+# ----------------------------------------------------------------------------
+
+def _db():
+    con = sqlite3.connect(LOG_DB)
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS fa_snapshots (
+            ts INTEGER, season TEXT, week INTEGER, league_id TEXT, field_size INTEGER,
+            pid TEXT, name TEXT, pos TEXT, proj REAL, pos_rank INTEGER,
+            starts_for INTEGER, of_teams INTEGER, tier INTEGER, max_delta REAL, max_swing REAL, chop_pool INTEGER);
+        CREATE INDEX IF NOT EXISTS fa_snap_ix ON fa_snapshots (league_id, week, pid, ts);
+        CREATE TABLE IF NOT EXISTS bids (
+            tx_id TEXT PRIMARY KEY, season TEXT, week INTEGER, league_id TEXT, ts INTEGER,
+            rid TEXT, owner TEXT, pid TEXT, name TEXT, pos TEXT, bid INTEGER, status TEXT,
+            drop_pid TEXT, drop_name TEXT,
+            faab_before INTEGER, share REAL, field_size INTEGER,
+            proj REAL, pos_rank INTEGER, starts_for INTEGER, of_teams INTEGER, tier INTEGER,
+            n_bidders INTEGER, second_bid INTEGER, winner INTEGER);
+    """)
+    return con
+
+
+def log_fa_snapshot(report, field_size, users, rosters, budget):
+    """One row per free agent on the board, at most hourly per league/week."""
+    con = _db()
+    lid, week = report["league_id"], report["week"]
+    last = con.execute("SELECT MAX(ts) FROM fa_snapshots WHERE league_id=? AND week=?", (lid, week)).fetchone()[0]
+    if last and time.time() - last < 3600:
+        con.close()
+        return
+    ts = int(time.time())
+    con.executemany("INSERT INTO fa_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+        (ts, CONFIG["season"], week, lid, field_size, c["id"], c["name"], c["pos"], c["proj"], c["pos_rank"],
+         c["demand"]["starts"], c["demand"]["of"], c["tier"], c["max_delta"], c["max_swing"], int(c["chop_pool"]))
+        for c in report["candidates_all"]])
+    con.commit()
+    con.close()
+
+
+def week_of(ts):
+    """NFL week a timestamp falls in (weeks roll on Sleeper's season start
+    weekday, a Wednesday). A Wednesday-3am waiver run counts for the week
+    that is about to be played, which is what the bids were for."""
+    st = get("/state/nfl")
+    start = time.mktime(time.strptime(st["season_start_date"], "%Y-%m-%d"))
+    return max(1, int((ts - start) // (7 * 86400)) + 1)
+
+
+def backfill_board(lid, run_claims, run_ts, rosters, users, players, con):
+    """Write fa_snapshot rows for the players bid on in a past run, with
+    demand computed against the rosters as they stood before that run."""
+    wk = week_of(run_ts)                       # the week the pickups were FOR
+    projections = load_projections(CONFIG["season"], wk, players)
+    lg = get(f"/league/{lid}")
+    scoring = lg.get("scoring_settings") or {}
+    slots = lg.get("roster_positions") or []
+    val = lambda p: proj_pts(p, projections, scoring) or 0.0
+    adds = {c["pid"] for c in run_claims if c["status"] == "complete"}
+    drops = {c["rid"]: c["dpid"] for c in run_claims if c["status"] == "complete" and c["dpid"]}
+    then = []
+    for r in rosters:
+        ids = [p for p in (r.get("players") or []) if p not in adds]
+        if r["roster_id"] in drops:
+            ids.append(drops[r["roster_id"]])
+        then.append({"roster_id": r["roster_id"], "players": ids})
+    usable = set().union(*(ELIGIBLE.get(sl, {sl}) for sl in slots if sl not in NON_SLOTS))
+    pos_rank = {}
+    for pos in usable:
+        ranked = sorted((pid for pid in projections if players.get(pid, {}).get("pos") == pos), key=lambda p: -val(p))
+        pos_rank.update({pid: i + 1 for i, pid in enumerate(ranked)})
+    base = {r["roster_id"]: sum(val(p) for p in best_lineup(r["players"], slots, val, players)) for r in then}
+    rows = []
+    for pid in {c["pid"] for c in run_claims}:
+        starts, best = 0, 0.0
+        for r in then:
+            lineup = best_lineup(r["players"] + [pid], slots, val, players)
+            if pid in lineup:
+                starts += 1
+                best = max(best, sum(val(p) for p in lineup) - base[r["roster_id"]])
+        of = len(then)
+        p = players.get(pid, {})
+        rows.append((run_ts - 1, CONFIG["season"], wk, lid, of, pid, p.get("name", pid), p.get("pos", ""),
+                     round(val(pid), 2), pos_rank.get(pid), starts, of, tier_of(starts / max(1, of)),
+                     round(best, 2), None, 0))
+    con.executemany("INSERT INTO fa_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    con.commit()
+
+
+def sync_bids(lid, week, users, rosters, budget):
+    """Pull Sleeper's waiver claims for every week so far and upsert them
+    with context from the latest snapshot taken before the claim ran."""
+    if time.time() - _bids_last.get(lid, 0) < 900:
+        return
+    _bids_last[lid] = time.time()
+    players = load_players()
+    rid_owner = {r["roster_id"]: users.get(r.get("owner_id"), f"Roster {r['roster_id']}") for r in rosters}
+    con = _db()
+    claims = []
+    for wk in range(1, week + 1):
+        for t in get(f"/league/{lid}/transactions/{wk}") or []:
+            if t.get("type") != "waiver" or not t.get("roster_ids"):
+                continue
+            adds = t.get("adds") or {}
+            if not adds:
+                continue
+            pid = next(iter(adds))
+            drops = t.get("drops") or {}
+            dpid = next(iter(drops), None)
+            claims.append({
+                "tx_id": str(t["transaction_id"]), "week": wk, "ts": int(t["status_updated"] / 1000),
+                "rid": t["roster_ids"][0], "pid": pid, "dpid": dpid,
+                "bid": int((t.get("settings") or {}).get("waiver_bid") or 0), "status": t.get("status"),
+            })
+    if not claims:
+        con.close()
+        return
+    # FAAB before each claim: budget minus this roster's wins in EARLIER runs
+    # (claims in the same run were all placed against the same balance).
+    won, run_won = {}, {}
+    for run in sorted({c["ts"] // 600 for c in claims}):
+        for c in [c for c in claims if c["ts"] // 600 == run]:
+            c["faab_before"] = budget - won.get(c["rid"], 0)
+            if c["status"] == "complete":
+                run_won[c["rid"]] = run_won.get(c["rid"], 0) + c["bid"]
+        for rid, v in run_won.items():
+            won[rid] = won.get(rid, 0) + v
+        run_won = {}
+    # Runs with no pre-bid board (before this table existed): reconstruct it.
+    # Rosters as they were = current rosters minus that run's completed adds,
+    # plus its drops; then the demand analysis for the players bid on.
+    for run in sorted({c["ts"] // 600 for c in claims}):
+        run_claims = [c for c in claims if c["ts"] // 600 == run]
+        run_ts = min(c["ts"] for c in run_claims)
+        have = con.execute("SELECT COUNT(*) FROM fa_snapshots WHERE league_id=? AND ts<=? AND ts>?",
+                           (lid, run_ts, run_ts - 7 * 86400)).fetchone()[0]
+        if have:
+            continue
+        backfill_board(lid, run_claims, run_ts, rosters, users, players, con)
+
+    # Clearing price and competition per (player, run).
+    by_key = {}
+    for c in claims:
+        by_key.setdefault((c["pid"], c["ts"] // 600), []).append(c)
+    rows = []
+    for c in claims:
+        group = sorted(by_key[(c["pid"], c["ts"] // 600)], key=lambda x: -x["bid"])
+        second = group[1]["bid"] if len(group) > 1 else None
+        snap = con.execute(
+            "SELECT field_size, proj, pos_rank, starts_for, of_teams, tier FROM fa_snapshots "
+            "WHERE league_id=? AND pid=? AND ts<=? ORDER BY ts DESC LIMIT 1", (lid, c["pid"], c["ts"])).fetchone()
+        if snap is None:  # no pre-bid board (e.g. week 1): fall back to the earliest one after
+            snap = con.execute(
+                "SELECT field_size, proj, pos_rank, starts_for, of_teams, tier FROM fa_snapshots "
+                "WHERE league_id=? AND pid=? ORDER BY ts LIMIT 1", (lid, c["pid"])).fetchone()
+        fs, proj, prank, sf, of, tier = snap if snap else (len(rosters), None, None, None, None, None)
+        p = players.get(c["pid"], {})
+        rows.append((c["tx_id"], CONFIG["season"], week_of(c["ts"]), lid, c["ts"], str(c["rid"]), rid_owner.get(c["rid"], "?"),
+                     c["pid"], p.get("name", c["pid"]), p.get("pos", ""), c["bid"], c["status"],
+                     c["dpid"], players.get(c["dpid"], {}).get("name") if c["dpid"] else None,
+                     c["faab_before"], round(c["bid"] / c["faab_before"], 4) if c["faab_before"] else None, fs,
+                     proj, prank, sf, of, tier, len(group), second, int(c["status"] == "complete")))
+    con.executemany("INSERT OR REPLACE INTO bids VALUES (" + ",".join("?" * 25) + ")", rows)
+    con.commit()
+    con.close()
 
 
 def roster_names(lid):
@@ -1705,6 +1894,47 @@ def api_waivers(lid):
         return jsonify({"error": str(exc)}), 502
 
 
+@app.route("/api/bids/<lid>")
+def api_bids(lid):
+    """Last run's results grouped by player, and per-owner behaviour."""
+    if not LOG_DB.exists():
+        return jsonify({"runs": [], "owners": []})
+    con = sqlite3.connect(LOG_DB)
+    con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute(
+        "SELECT * FROM bids WHERE league_id=? ORDER BY ts DESC, pid, bid DESC", (lid,)).fetchall()]
+    con.close()
+    runs = {}
+    for r in rows:
+        runs.setdefault(r["ts"] // 600, []).append(r)
+    out_runs = []
+    for k in sorted(runs, reverse=True)[:6]:
+        by_p = {}
+        for r in runs[k]:
+            by_p.setdefault(r["pid"], {"name": r["name"], "pos": r["pos"], "tier": r["tier"], "proj": r["proj"],
+                                       "starts_for": r["starts_for"], "of": r["of_teams"], "bids": []})
+            by_p[r["pid"]]["bids"].append({"owner": r["owner"], "bid": r["bid"], "won": r["winner"],
+                                          "share": r["share"], "drop": r["drop_name"]})
+        players_ = sorted(by_p.values(), key=lambda x: -max(b["bid"] for b in x["bids"]))
+        out_runs.append({"ts": min(r["ts"] for r in runs[k]), "week": runs[k][0]["week"],
+                         "field_size": runs[k][0]["field_size"], "players": players_})
+    owners = {}
+    for r in rows:
+        o = owners.setdefault(r["owner"], {"owner": r["owner"], "bids": 0, "won": 0, "spent": 0, "faab": None,
+                                          "by_tier": {1: [], 2: [], 3: [], None: []}, "over": []})
+        o["bids"] += 1
+        o["won"] += r["winner"]
+        o["spent"] += r["bid"] if r["winner"] else 0
+        o["by_tier"].setdefault(r["tier"], []).append(r["share"] or 0)
+        if r["winner"] and r["second_bid"] is not None and r["second_bid"] > 0:
+            o["over"].append(r["bid"] / r["second_bid"])
+    for o in owners.values():
+        o["by_tier"] = {str(t or "?"): {"n": len(v), "avg_share": round(100 * sum(v) / len(v), 1)} for t, v in o["by_tier"].items() if v}
+        o["avg_over"] = round(sum(o["over"]) / len(o["over"]), 2) if o["over"] else None
+        o.pop("over")
+    return jsonify({"runs": out_runs, "owners": sorted(owners.values(), key=lambda o: -o["spent"])})
+
+
 @app.route("/l/<lid>")
 def league_page(lid):
     if lid not in CONFIG["shared_leagues"]:
@@ -1721,10 +1951,17 @@ def healthz():
 @app.route("/tick")
 def tick():
     """Unauthenticated poke that runs a build (and so a log snapshot). Hit by
-    the game-window cron so the calibration log records without a viewer."""
+    the game-window cron so the calibration log records without a viewer.
+    ?waivers=1 also refreshes the waiver boards (pre-bid snapshots + bid sync)."""
     data, err = current_state()
     if err:
         return Response(f"error: {err}", 502)
+    if request.args.get("waivers"):
+        for lid in CONFIG["shared_leagues"]:
+            try:
+                waiver_report(lid)
+            except Exception as exc:
+                return Response(f"waivers error {lid}: {exc}", 502)
     return Response(f"ok wk{data['week']} {data['updated']}", mimetype="text/plain")
 
 
@@ -1994,6 +2231,42 @@ async function loadWaivers(lid){
   try { const d = await (await fetch(`/api/waivers/${lid}${waivAs[lid] ? `?as=${waivAs[lid]}` : ''}`)).json(); waiv[waivKey(lid)] = {ts: Date.now(), data: d}; return d; }
   catch(e){ return null; }
 }
+// ---- bids history ----
+const bidsCache = {};
+async function loadBids(lid){
+  const b = bidsCache[lid];
+  if (b && Date.now() - b.ts < 600000) return b.data;
+  try { const d = await (await fetch(`/api/bids/${lid}`)).json(); bidsCache[lid] = {ts: Date.now(), data: d}; return d; }
+  catch(e){ return null; }
+}
+const TIER = {1: 'endgame', 2: 'starter', 3: 'fill-in'};
+function bidsBlock(lid){
+  const b = bidsCache[lid];
+  if (!(b && Date.now() - b.ts < 600000)) { loadBids(lid).then(() => tick()); return '<div class="pos">loading bids…</div>'; }
+  const d = b.data;
+  if (!d.runs.length) return '<div class="pos">No waiver claims recorded yet.</div>';
+  const key = 'bids:' + lid, isOpen = open.has(key);
+  let html = `<h3 class="bench" onclick="event.stopPropagation();toggle('${key}')" style="cursor:pointer">Bids · ${d.runs.length} run${d.runs.length > 1 ? 's' : ''} · <span style="text-decoration:underline">${isOpen ? 'hide' : 'show'}</span></h3>`;
+  if (!isOpen) return html;
+  const run = d.runs[0];
+  const when = new Date(run.ts * 1000).toLocaleDateString(undefined, {weekday: 'short', month: 'short', day: 'numeric'});
+  html += `<div class="pos" style="font-size:12.5px;margin:0 0 6px">Last run · ${when} · for week ${run.week} · ${run.field_size} teams. Winner bold; share = bid as % of the bidder's FAAB at the time.</div>
+    <table><tr><th>Player</th><th>Tier</th><th class="r">Proj</th><th class="r">Starts for</th><th style="padding-left:14px">Bids (high → low)</th></tr>
+    ${run.players.map(p => `<tr>
+      <td>${p.name} <span class="pos">${p.pos}</span></td>
+      <td class="pos">${TIER[p.tier] || '?'}</td>
+      <td class="r num pos">${p.proj == null ? '—' : p.proj.toFixed(1)}</td>
+      <td class="r num pos">${p.starts_for == null ? '—' : `${p.starts_for}/${p.of}`}</td>
+      <td class="pos" style="padding-left:14px;font-size:12.5px">${p.bids.map(x => `${x.won ? '<b class="long">' : ''}${x.owner} <span class="num">${x.bid}</span>${x.share != null ? `<span style="font-size:11px"> (${(x.share*100).toFixed(0)}%)</span>` : ''}${x.won ? '</b>' : ''}`).join(', ')}</td></tr>`).join('')}</table>`;
+  html += `<h3>Owner behaviour · all runs · avg share of FAAB bid, by tier</h3>
+    <table><tr><th>Owner</th><th class="r">Bids</th><th class="r">Won</th><th class="r">Spent</th><th class="r">Endgame</th><th class="r">Starter</th><th class="r">Fill-in</th><th class="r" title="winning bid / second-highest bid">Overpay ×</th></tr>
+    ${d.owners.map(o => `<tr>
+      <td>${o.owner}</td><td class="r num">${o.bids}</td><td class="r num">${o.won}</td><td class="r num">${o.spent}</td>
+      ${['1','2','3'].map(t => { const v = o.by_tier[t]; return `<td class="r num ${v && v.avg_share >= 15 ? 'short' : 'pos'}">${v ? `${v.avg_share}% <span style="font-size:11px">(${v.n})</span>` : '—'}</td>`; }).join('')}
+      <td class="r num pos">${o.avg_over == null ? '—' : o.avg_over.toFixed(2)}</td></tr>`).join('')}</table>`;
+  return html;
+}
+
 function waiverSection(pools){
   if (LEAGUE_ID || !pools.length) return '';
   if (!waivLeague || !pools.some(l => l.league_id === waivLeague)) waivLeague = (pools.find(l => l.league_id === FAV) || pools[0]).league_id;
@@ -2032,6 +2305,7 @@ function waiverSection(pools){
         <td class="r num ${h.rank > d.field_size * 0.67 ? 'short' : (h.rank <= 3 ? 'long' : '')}">${h.rank}/${h.of}</td>
         <td class="r num pos">${f2(h.median)}</td><td class="r num pos">${f2(h.best)}</td>
         <td class="r num ${sgn(h.gap)}">${h.gap > 0 ? '+' : ''}${f2(h.gap)}</td></tr>`).join('')}</table>`;
+    body += bidsBlock(waivLeague);
     body += `<h3>Top free agents · what adding each does to next week${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''}</h3>
       <table><tr><th>Player</th><th class="r">Proj</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
       ${d.candidates.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
