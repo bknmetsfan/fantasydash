@@ -1439,9 +1439,42 @@ WAIVER_LOG = 30           # free agents snapshotted for the bids database
 _bids_last = {}           # league_id -> ts of last transactions sync
 
 
-def tier_of(frac):
-    """Free-agent tier from the share of teams he'd start for."""
-    return 1 if frac >= 0.75 else (2 if frac >= 0.33 else 3)
+# Endgame = still clearly a starter with five weeks left: top-N at the
+# position by full-season projection (Sleeper's season totals, which don't
+# swing with byes and matchups the way weekly numbers do).
+ENDGAME_RANK = {"QB": 12, "RB": 10, "WR": 15, "TE": 5}
+_season_cache = {"ts": 0.0, "rank": {}}
+
+
+def season_pos_rank(players):
+    """{pid: rank at position by season-long pts_ppr}. Cached 6h."""
+    if time.time() - _season_cache["ts"] < 6 * 3600 and _season_cache["rank"]:
+        return _season_cache["rank"]
+    qs = "&".join(f"position[]={p}" for p in ("QB", "RB", "WR", "TE"))
+    try:
+        rows = get(f"/{CONFIG['season']}?season_type=regular&{qs}", base=PROJ_BASE)
+    except Exception:
+        return _season_cache["rank"]
+    by_pos = {}
+    for row in rows:
+        pid = row["player_id"]
+        pos = players.get(pid, {}).get("pos")
+        if pos in ENDGAME_RANK:
+            by_pos.setdefault(pos, []).append((pid, (row.get("stats") or {}).get("pts_ppr") or 0.0))
+    rank = {}
+    for pos, lst in by_pos.items():
+        for i, (pid, _) in enumerate(sorted(lst, key=lambda t: -t[1])):
+            rank[pid] = i + 1
+    _season_cache.update(ts=time.time(), rank=rank)
+    return rank
+
+
+def tier_of(frac, pos=None, season_rank=None):
+    """1 endgame: top-N at position for the season. 2 starter: would start
+    for a third of the league this week. 3 fill-in."""
+    if pos in ENDGAME_RANK and season_rank is not None and season_rank <= ENDGAME_RANK[pos]:
+        return 1
+    return 2 if frac >= 0.33 else 3
 
 
 def waiver_report(lid, as_rid=None):
@@ -1550,11 +1583,13 @@ def waiver_report(lid, as_rid=None):
     fas = sorted((pid for pid in set(projections) | chop_pool if pid not in rostered
                   and players.get(pid, {}).get("pos") in usable and players.get(pid, {}).get("team", "FA") != "FA"),
                  key=lambda p: -val(p))[:WAIVER_LOG]
-    # Positional rank among everyone (rostered + FA) with a projection.
+    # Positional rank among everyone (rostered + FA): weekly for the board,
+    # season-long for the endgame tier.
     pos_rank = {}
     for pos in usable:
         ranked = sorted((pid for pid in projections if players.get(pid, {}).get("pos") == pos), key=lambda p: -val(p))
         pos_rank.update({pid: i + 1 for i, pid in enumerate(ranked)})
+    srank = season_pos_rank(players)
     old_lineup = set(my_det)
     base_proj = {rid: sum(d["proj"] for d in det.values()) for rid, det in dets.items()}
     base_chop = {rid: 100 * float(chop_all[rids.index(rid)]) for rid in rids}
@@ -1588,7 +1623,8 @@ def waiver_report(lid, as_rid=None):
         frac = len(wants) / max(1, len(rosters) - 1)
         cands.append({"id": pid, "name": p.get("name", pid), "pos": p.get("pos", ""), "team": p.get("team", ""),
                       "proj": round(val(pid), 2), "starts": pid in det2, "chop_pool": pid in chop_pool,
-                      "pos_rank": pos_rank.get(pid), "tier": tier_of(frac),
+                      "pos_rank": pos_rank.get(pid), "season_rank": srank.get(pid),
+                      "tier": tier_of(frac, p.get("pos"), srank.get(pid)),
                       "max_delta": round(max((w["delta"] for w in wants), default=0.0), 2),
                       "max_swing": round(min((w["chop_swing"] for w in wants), default=0.0), 1),
                       "proj_after": proj2, "delta": round(proj2 - base["proj"], 2),
@@ -1646,7 +1682,8 @@ def _db():
         CREATE TABLE IF NOT EXISTS fa_snapshots (
             ts INTEGER, season TEXT, week INTEGER, league_id TEXT, field_size INTEGER,
             pid TEXT, name TEXT, pos TEXT, proj REAL, pos_rank INTEGER,
-            starts_for INTEGER, of_teams INTEGER, tier INTEGER, max_delta REAL, max_swing REAL, chop_pool INTEGER);
+            starts_for INTEGER, of_teams INTEGER, tier INTEGER, max_delta REAL, max_swing REAL, chop_pool INTEGER,
+            season_rank INTEGER);
         CREATE INDEX IF NOT EXISTS fa_snap_ix ON fa_snapshots (league_id, week, pid, ts);
         CREATE TABLE IF NOT EXISTS bids (
             tx_id TEXT PRIMARY KEY, season TEXT, week INTEGER, league_id TEXT, ts INTEGER,
@@ -1654,8 +1691,12 @@ def _db():
             drop_pid TEXT, drop_name TEXT,
             faab_before INTEGER, share REAL, field_size INTEGER,
             proj REAL, pos_rank INTEGER, starts_for INTEGER, of_teams INTEGER, tier INTEGER,
-            n_bidders INTEGER, second_bid INTEGER, winner INTEGER);
+            n_bidders INTEGER, second_bid INTEGER, winner INTEGER, season_rank INTEGER);
     """)
+    for table in ("fa_snapshots", "bids"):        # migrate DBs created before season_rank
+        if "season_rank" not in [r[1] for r in con.execute(f"PRAGMA table_info({table})")]:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN season_rank INTEGER")
+    con.commit()
     return con
 
 
@@ -1668,9 +1709,10 @@ def log_fa_snapshot(report, field_size, users, rosters, budget):
         con.close()
         return
     ts = int(time.time())
-    con.executemany("INSERT INTO fa_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+    con.executemany("INSERT INTO fa_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
         (ts, CONFIG["season"], week, lid, field_size, c["id"], c["name"], c["pos"], c["proj"], c["pos_rank"],
-         c["demand"]["starts"], c["demand"]["of"], c["tier"], c["max_delta"], c["max_swing"], int(c["chop_pool"]))
+         c["demand"]["starts"], c["demand"]["of"], c["tier"], c["max_delta"], c["max_swing"], int(c["chop_pool"]),
+         c["season_rank"])
         for c in report["candidates_all"]])
     con.commit()
     con.close()
@@ -1708,6 +1750,7 @@ def backfill_board(lid, run_claims, run_ts, rosters, users, players, con):
         ranked = sorted((pid for pid in projections if players.get(pid, {}).get("pos") == pos), key=lambda p: -val(p))
         pos_rank.update({pid: i + 1 for i, pid in enumerate(ranked)})
     base = {r["roster_id"]: sum(val(p) for p in best_lineup(r["players"], slots, val, players)) for r in then}
+    srank = season_pos_rank(players)
     rows = []
     for pid in {c["pid"] for c in run_claims}:
         starts, best = 0, 0.0
@@ -1719,9 +1762,9 @@ def backfill_board(lid, run_claims, run_ts, rosters, users, players, con):
         of = len(then)
         p = players.get(pid, {})
         rows.append((run_ts - 1, CONFIG["season"], wk, lid, of, pid, p.get("name", pid), p.get("pos", ""),
-                     round(val(pid), 2), pos_rank.get(pid), starts, of, tier_of(starts / max(1, of)),
-                     round(best, 2), None, 0))
-    con.executemany("INSERT INTO fa_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                     round(val(pid), 2), pos_rank.get(pid), starts, of,
+                     tier_of(starts / max(1, of), p.get("pos"), srank.get(pid)), round(best, 2), None, 0, srank.get(pid)))
+    con.executemany("INSERT INTO fa_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     con.commit()
 
 
@@ -1785,20 +1828,20 @@ def sync_bids(lid, week, users, rosters, budget):
         group = sorted(by_key[(c["pid"], c["ts"] // 600)], key=lambda x: -x["bid"])
         second = group[1]["bid"] if len(group) > 1 else None
         snap = con.execute(
-            "SELECT field_size, proj, pos_rank, starts_for, of_teams, tier FROM fa_snapshots "
+            "SELECT field_size, proj, pos_rank, starts_for, of_teams, tier, season_rank FROM fa_snapshots "
             "WHERE league_id=? AND pid=? AND ts<=? ORDER BY ts DESC LIMIT 1", (lid, c["pid"], c["ts"])).fetchone()
         if snap is None:  # no pre-bid board (e.g. week 1): fall back to the earliest one after
             snap = con.execute(
-                "SELECT field_size, proj, pos_rank, starts_for, of_teams, tier FROM fa_snapshots "
+                "SELECT field_size, proj, pos_rank, starts_for, of_teams, tier, season_rank FROM fa_snapshots "
                 "WHERE league_id=? AND pid=? ORDER BY ts LIMIT 1", (lid, c["pid"])).fetchone()
-        fs, proj, prank, sf, of, tier = snap if snap else (len(rosters), None, None, None, None, None)
+        fs, proj, prank, sf, of, tier, srk = snap if snap else (len(rosters), None, None, None, None, None, None)
         p = players.get(c["pid"], {})
         rows.append((c["tx_id"], CONFIG["season"], week_of(c["ts"]), lid, c["ts"], str(c["rid"]), rid_owner.get(c["rid"], "?"),
                      c["pid"], p.get("name", c["pid"]), p.get("pos", ""), c["bid"], c["status"],
                      c["dpid"], players.get(c["dpid"], {}).get("name") if c["dpid"] else None,
                      c["faab_before"], round(c["bid"] / c["faab_before"], 4) if c["faab_before"] else None, fs,
-                     proj, prank, sf, of, tier, len(group), second, int(c["status"] == "complete")))
-    con.executemany("INSERT OR REPLACE INTO bids VALUES (" + ",".join("?" * 25) + ")", rows)
+                     proj, prank, sf, of, tier, len(group), second, int(c["status"] == "complete"), srk))
+    con.executemany("INSERT OR REPLACE INTO bids VALUES (" + ",".join("?" * 26) + ")", rows)
     con.commit()
     con.close()
 
@@ -1911,7 +1954,7 @@ def api_bids(lid):
     for k in sorted(runs, reverse=True)[:6]:
         by_p = {}
         for r in runs[k]:
-            by_p.setdefault(r["pid"], {"name": r["name"], "pos": r["pos"], "tier": r["tier"], "proj": r["proj"],
+            by_p.setdefault(r["pid"], {"name": r["name"], "pos": r["pos"], "tier": r["tier"], "proj": r["proj"], "season_rank": r["season_rank"],
                                        "starts_for": r["starts_for"], "of": r["of_teams"], "bids": []})
             by_p[r["pid"]]["bids"].append({"owner": r["owner"], "bid": r["bid"], "won": r["winner"],
                                           "share": r["share"], "drop": r["drop_name"]})
@@ -2254,7 +2297,7 @@ function bidsBlock(lid){
     <table><tr><th>Player</th><th>Tier</th><th class="r">Proj</th><th class="r">Starts for</th><th style="padding-left:14px">Bids (high → low)</th></tr>
     ${run.players.map(p => `<tr>
       <td>${p.name} <span class="pos">${p.pos}</span></td>
-      <td class="pos">${TIER[p.tier] || '?'}</td>
+      <td class="pos">${TIER[p.tier] || '?'}${p.tier === 1 && p.season_rank ? ` <span style="font-size:11px">${p.pos}${p.season_rank}</span>` : ''}</td>
       <td class="r num pos">${p.proj == null ? '—' : p.proj.toFixed(1)}</td>
       <td class="r num pos">${p.starts_for == null ? '—' : `${p.starts_for}/${p.of}`}</td>
       <td class="pos" style="padding-left:14px;font-size:12.5px">${p.bids.map(x => `${x.won ? '<b class="long">' : ''}${x.owner} <span class="num">${x.bid}</span>${x.share != null ? `<span style="font-size:11px"> (${(x.share*100).toFixed(0)}%)</span>` : ''}${x.won ? '</b>' : ''}`).join(', ')}</td></tr>`).join('')}</table>`;
@@ -2309,7 +2352,7 @@ function waiverSection(pools){
     body += `<h3>Top free agents · what adding each does to next week${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''}</h3>
       <table><tr><th>Player</th><th class="r">Proj</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
       ${d.candidates.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
-        <td>${c.name} <span class="pos">${c.pos} ${c.team}</span>${c.chop_pool ? ` <span class="short" style="font-size:11px">chop pool</span>` : ''}</td>
+        <td>${c.name} <span class="pos">${c.pos} ${c.team}</span>${c.tier === 1 ? ` <span class="long" style="font-size:11px">endgame ${c.pos}${c.season_rank}</span>` : (c.tier === 2 ? ` <span class="pos" style="font-size:11px">starter</span>` : '')}${c.chop_pool ? ` <span class="short" style="font-size:11px">chop pool</span>` : ''}</td>
         <td class="r num">${f2(c.proj)}</td><td class="r num">${f2(c.proj_after)}</td>
         <td class="r num ${sgn(c.delta)}">${c.delta > 0 ? '+' : ''}${f2(c.delta)}</td>
         <td class="r num ${c.chop_after < d.base.chop_pct ? 'long' : 'pos'}">${c.chop_after}%<span class="pos" style="font-size:11px"> (${(c.chop_after - d.base.chop_pct) > 0 ? '+' : ''}${(c.chop_after - d.base.chop_pct).toFixed(1)})</span></td>
