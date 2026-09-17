@@ -2609,7 +2609,8 @@ async function tick(){
   const bookHtml = `<table>
     <tr><th>Player</th><th class="r">Pts</th><th class="r">Proj final</th><th class="r" title="root x remaining projection: swing still on the table">Impact</th><th class="r" title="pp of survival/win per fantasy point, summed over leagues">Root /pt</th><th>Leagues</th></tr>
     ${bookRows(d.book)}</table>`;
-  html += section('book', 'Exposure', bookHtml, d.book.length);
+  const gamesLive = d.book.some(p => p.rem > 0 && p.rem < 1);
+  html += section('book', 'Exposure', bookHtml, d.book.length, !gamesLive);
   html += waiverSection(pools);
   html += chartSection(d.leagues);
   if (manual.length){
