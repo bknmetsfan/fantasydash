@@ -2267,6 +2267,7 @@ function chartSection(pools){
 const waiv = {};            // `${league_id}|${as}` -> {ts, data}
 let waivLeague = null;
 const waivAs = {};          // league_id -> rid being analysed ('' = me)
+const waivPos = {};         // league_id -> Set of positions shown (default: all but QB in 1-QB leagues)
 const waivKey = lid => `${lid}|${waivAs[lid] || ''}`;
 async function loadWaivers(lid){
   const w = waiv[waivKey(lid)];
@@ -2349,9 +2350,14 @@ function waiverSection(pools){
         <td class="r num pos">${f2(h.median)}</td><td class="r num pos">${f2(h.best)}</td>
         <td class="r num ${sgn(h.gap)}">${h.gap > 0 ? '+' : ''}${f2(h.gap)}</td></tr>`).join('')}</table>`;
     body += bidsBlock(waivLeague);
-    body += `<h3>Top free agents · what adding each does to next week${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''}</h3>
+    const allPos = [...new Set(d.candidates_all.map(c => c.pos))].sort((a,b) => ['QB','RB','WR','TE','K','DEF'].indexOf(a) - ['QB','RB','WR','TE','K','DEF'].indexOf(b));
+    if (!waivPos[waivLeague]) waivPos[waivLeague] = new Set(allPos.filter(p => p !== 'QB' || d.slot_order.includes('SF') || d.slot_order.some(x => x.startsWith('QB2'))));
+    const shownPos = waivPos[waivLeague];
+    const posBar = allPos.map(p => `<label class="lg-item"><input type="checkbox" ${shownPos.has(p) ? 'checked' : ''} onclick="event.stopPropagation();(waivPos['${waivLeague}'].has('${p}') ? waivPos['${waivLeague}'].delete('${p}') : waivPos['${waivLeague}'].add('${p}'));tick()"> ${p}</label>`).join(' ');
+    const cands = d.candidates_all.filter(c => shownPos.has(c.pos)).slice(0, 12);
+    body += `<h3>Top free agents · what adding each does to next week${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''} &nbsp; <span style="font-weight:400">${posBar}</span></h3>
       <table><tr><th>Player</th><th class="r">Proj</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
-      ${d.candidates.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
+      ${cands.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
         <td>${c.name} <span class="pos">${c.pos} ${c.team}</span>${c.tier === 1 ? ` <span class="long" style="font-size:11px">endgame ${c.pos}${c.season_rank}</span>` : (c.tier === 2 ? ` <span class="pos" style="font-size:11px">starter</span>` : '')}${c.chop_pool ? ` <span class="short" style="font-size:11px">chop pool</span>` : ''}</td>
         <td class="r num">${f2(c.proj)}</td><td class="r num">${f2(c.proj_after)}</td>
         <td class="r num ${sgn(c.delta)}">${c.delta > 0 ? '+' : ''}${f2(c.delta)}</td>
