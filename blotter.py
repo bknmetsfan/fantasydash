@@ -2156,11 +2156,14 @@ let showMinor = false;    // feed: show the full list instead of the last 12
 const collapsed = new Set((() => { try { return JSON.parse(localStorage.getItem('collapsed') || '[]'); } catch(e){ return []; } })());
 function toggleSection(id){
   collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
-  try { localStorage.setItem('collapsed', JSON.stringify([...collapsed])); } catch(e){}
+  userToggled.add(id);
+  try { localStorage.setItem('collapsed', JSON.stringify([...collapsed])); localStorage.setItem('toggled', JSON.stringify([...userToggled])); } catch(e){}
   tick();
 }
-function section(id, title, body, count){
-  const c = collapsed.has(id);
+const userToggled = new Set((() => { try { return JSON.parse(localStorage.getItem('toggled') || '[]'); } catch(e){ return []; } })());
+function section(id, title, body, count, autoCollapse){
+  // autoCollapse: fold by default (e.g. an empty feed) unless the user has toggled this section themselves.
+  const c = userToggled.has(id) ? collapsed.has(id) : (autoCollapse ?? collapsed.has(id));
   return `<h2 class="sec" onclick="toggleSection('${id}')"><span class="caret">${c ? '▸' : '▾'}</span> ${title}${count !== undefined ? ` <span class="cnt">${count}</span>` : ''}</h2>${c ? '' : body}`;
 }
 function toggle(id){ open.has(id) ? open.delete(id) : open.add(id); tick(); }
@@ -2569,7 +2572,7 @@ function leagueTick(d){
         .map(p => ({...p, for: mine.has(p.id) ? ['you'] : [], against: theirs.has(p.id) ? [me.proj_ref.name] : [],
                     deltas: {you: (p.deltas || {})._, [me.proj_ref.name]: (p.deltas || {})._}}))}))
       .filter(e => e.players.length);
-    html += section('feed', 'Feed', feedRows(feed), feed.length);
+    html += section('feed', 'Feed', feedRows(feed), feed.length, !feed.length);
     html += chartSection([me]);
   } else {
     html += `<div class="pos" style="margin:12px 0 20px">Pick your team to see your margin, survival odds and lineup.</div>`;
@@ -2602,7 +2605,7 @@ async function tick(){
   if (pools.length) html += section('pools', 'Guillotine', pools.map(chopCard).join(''));
   if (h2h.length) html += section('h2h', 'Head to head', h2h.map(h2hRow).join(''));
   if (manual.length) html += section('solo', 'Solo', manual.map(manualRow).join(''));
-  html += section('feed', 'Feed', feedRows(d.feed), (d.feed || []).length);
+  html += section('feed', 'Feed', feedRows(d.feed), (d.feed || []).length, !(d.feed || []).length);
   const bookHtml = `<table>
     <tr><th>Player</th><th class="r">Pts</th><th class="r">Proj final</th><th class="r" title="root x remaining projection: swing still on the table">Impact</th><th class="r" title="pp of survival/win per fantasy point, summed over leagues">Root /pt</th><th>Leagues</th></tr>
     ${bookRows(d.book)}</table>`;
