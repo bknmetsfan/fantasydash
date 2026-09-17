@@ -1415,8 +1415,10 @@ def current_state():
     fresh = _cache["data"] is not None and now - _cache["ts"] <= CONFIG["poll_seconds"]
     if fresh:
         return _cache["data"], None
-    if not _build_lock.acquire(blocking=_cache["data"] is None, timeout=60):
-        return (_cache["data"], None) if _cache["data"] is not None else (None, "build in progress")
+    have = _cache["data"] is not None
+    got = _build_lock.acquire(timeout=60) if not have else _build_lock.acquire(blocking=False)
+    if not got:
+        return (_cache["data"], None) if have else (None, "build in progress")
     try:
         if _cache["data"] is None or now - _cache["ts"] > CONFIG["poll_seconds"]:
             try:
