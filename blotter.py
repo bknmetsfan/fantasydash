@@ -20,6 +20,7 @@ import re
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import unicodedata
 from pathlib import Path
 
@@ -839,10 +840,22 @@ def load_espn(week, players, games, stats):
     out = []
     for lc in cfg.get("leagues", []):
         lid = f"espn:{lc['league_id']}"
-        try:
+        def fetch():
             lg = League(league_id=int(lc["league_id"]), year=int(CONFIG["season"]),
                         espn_s2=cfg.get("espn_s2"), swid=cfg.get("swid"))
-            boxes = lg.box_scores(week)
+            return lg, lg.box_scores(week)
+        try:
+            # espn-api issues requests with no timeout; when ESPN hangs, so
+            # would the whole build (and every thread queued behind it).
+            ex = ThreadPoolExecutor(max_workers=1)
+            try:
+                lg, boxes = ex.submit(fetch).result(timeout=20)
+            finally:
+                ex.shutdown(wait=False)        # a hung fetch thread is abandoned, not joined
+        except FutureTimeout:
+            out.append({"league_id": lid, "name": lc.get("name") or f"ESPN {lc['league_id']}",
+                        "mode": "error", "error": "ESPN API not responding (timed out after 20s); retrying next refresh"})
+            continue
         except Exception as exc:
             msg = str(exc)
             if "credentials" in msg.lower() or "401" in msg or "403" in msg:
@@ -1393,18 +1406,29 @@ def set_auth_cookie(resp):
 
 
 def current_state():
-    """Cached build, refreshed at most every poll_seconds. Returns (data, error)."""
-    with _build_lock:
-        now = time.time()
+    """
+    Cached build, refreshed at most every poll_seconds. Returns (data, error).
+    If a build is already running, serve what we have rather than queueing:
+    a slow upstream must not tie up every request thread.
+    """
+    now = time.time()
+    fresh = _cache["data"] is not None and now - _cache["ts"] <= CONFIG["poll_seconds"]
+    if fresh:
+        return _cache["data"], None
+    if not _build_lock.acquire(blocking=_cache["data"] is None, timeout=60):
+        return (_cache["data"], None) if _cache["data"] is not None else (None, "build in progress")
+    try:
         if _cache["data"] is None or now - _cache["ts"] > CONFIG["poll_seconds"]:
             try:
                 _cache["data"] = build()
-                _cache["ts"] = now
+                _cache["ts"] = time.time()
             except Exception as exc:
                 if _cache["data"] is None:
                     return None, str(exc)
                 _cache["data"]["stale"] = str(exc)
         return _cache["data"], None
+    finally:
+        _build_lock.release()
 
 
 @app.route("/api/state")
