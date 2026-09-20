@@ -674,8 +674,10 @@ def load_manual(players, projections, stats, games, week):
     """
     if not MANUAL_FILE.exists():
         return []
+    # Prefer rostered players: name clashes with free agents (Kenneth Walker
+    # the WR, Antonio Williams the RB) would otherwise win on dict order.
     index = {}
-    for pid, p in players.items():
+    for pid, p in sorted(players.items(), key=lambda kv: kv[1].get("team") in (None, "", "FA")):
         index.setdefault(norm(p["name"]), pid)
 
     out = []

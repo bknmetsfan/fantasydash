@@ -3,21 +3,30 @@
     "name": "Eliminator.gg",
     "scoring": "eliminator",
     "starters": [
-      "Jalen Hurts",
-      "Jonathan Taylor",
-      "Saquon Barkley",
-      "Jaylen Waddle",
-      "CeeDee Lamb",
+      "Jayden Daniels",
+      "Kenneth Walker",
       {
-        "name": "Nico Collins",
+        "name": "Breece Hall",
         "mult": 1.5
       },
-      "Dallas Goedert",
+      "Antonio Williams",
       {
-        "name": "Jahmyr Gibbs",
+        "name": "Drake London",
+        "mult": 1.5
+      },
+      {
+        "name": "Chris Godwin",
+        "mult": 1.5
+      },
+      {
+        "name": "Colston Loveland",
+        "mult": 1.5
+      },
+      {
+        "name": "Bijan Robinson",
         "mult": 1.5
       }
     ],
-    "week": 1
+    "week": 2
   }
 ]
