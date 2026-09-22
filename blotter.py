@@ -1608,9 +1608,18 @@ def waiver_report(lid, as_rid=None):
     rostered = {p for r in rosters for p in r["players"]}
     # Only positions the league has a slot for (no DEF/K in leagues without them).
     usable = set().union(*(ELIGIBLE.get(sl, {sl}) for sl in slots if sl not in NON_SLOTS)) & WAIVER_POS
-    fas = sorted((pid for pid in set(projections) | chop_pool if pid not in rostered
-                  and players.get(pid, {}).get("pos") in usable and players.get(pid, {}).get("team", "FA") != "FA"),
-                 key=lambda p: -val(p))[:WAIVER_LOG]
+    pool = [pid for pid in set(projections) | chop_pool if pid not in rostered
+            and players.get(pid, {}).get("pos") in usable and players.get(pid, {}).get("team", "FA") != "FA"]
+    # Screen the whole pool cheaply first (lineup delta, no sims): a gem with a
+    # modest projection can be worth more to this roster than the top name on
+    # the wire. Keep the top by projection too, so the bids snapshot still
+    # covers the players rivals will actually bid on.
+    base_proj_mine = sum(d["proj"] for d in dets[my_rid].values())
+    screen = {pid: sum(val(p) for p in best_lineup(list(mine["players"]) + [pid], slots, val, players))
+                   - base_proj_mine for pid in pool}
+    by_val = sorted(pool, key=lambda p: -val(p))[:WAIVER_LOG]
+    by_delta = sorted(pool, key=lambda p: (-screen[p], -val(p)))[:WAIVER_LOG]
+    fas = sorted(set(by_val) | set(by_delta), key=lambda p: (-screen[p], -val(p)))
     # Positional rank among everyone (rostered + FA): weekly for the board,
     # season-long for the endgame tier.
     pos_rank = {}
@@ -1690,6 +1699,9 @@ def waiver_report(lid, as_rid=None):
         "slot_order": slot_order,
         "lineup": lineup_rows_out, "set_not_optimal": not_optimal, "lineup_set": bool(set_now),
     }
+    # Sort by what the add is worth to this roster, not by raw projection —
+    # otherwise streaming QBs crowd out a real upgrade in a 1-QB league.
+    cands.sort(key=lambda c: (-c["delta"], -c["proj"]))
     report["candidates_all"] = cands            # for logging; UI shows WAIVER_TOP
     report["candidates"] = cands[:WAIVER_TOP]
     _waiver_cache[(lid, as_rid)] = (time.time(), report)
@@ -2386,7 +2398,7 @@ function waiverSection(pools){
     const shownPos = waivPos[waivLeague];
     const posBar = allPos.map(p => `<label class="lg-item"><input type="checkbox" ${shownPos.has(p) ? 'checked' : ''} onclick="event.stopPropagation();(waivPos['${waivLeague}'].has('${p}') ? waivPos['${waivLeague}'].delete('${p}') : waivPos['${waivLeague}'].add('${p}'));tick()"> ${p}</label>`).join(' ');
     const cands = d.candidates_all.filter(c => shownPos.has(c.pos)).slice(0, 12);
-    body += `<h3>Top free agents · what adding each does to next week${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''} &nbsp; <span style="font-weight:400">${posBar}</span></h3>
+    body += `<h3>Top free agents · best Δ to your lineup, whole wire screened${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''} &nbsp; <span style="font-weight:400">${posBar}</span></h3>
       <table><tr><th>Player</th><th class="r">Proj</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
       ${cands.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
         <td>${c.name} <span class="pos">${c.pos} ${c.team}</span>${c.tier === 1 ? ` <span class="long" style="font-size:11px">endgame ${c.pos}${c.season_rank}</span>` : (c.tier === 2 ? ` <span class="pos" style="font-size:11px">starter</span>` : '')}${c.chop_pool ? ` <span class="short" style="font-size:11px">chop pool</span>` : ''}</td>
