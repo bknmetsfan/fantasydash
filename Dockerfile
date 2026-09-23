@@ -3,6 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY blotter.py manual.json ./
+COPY rankings/ ./rankings/
 ENV DATA_DIR=/data PORT=8080 TZ=America/New_York
 EXPOSE 8080
 # One worker: the state cache, sim and build lock are in-process.

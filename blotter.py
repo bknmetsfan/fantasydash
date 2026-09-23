@@ -1467,34 +1467,125 @@ WAIVER_LOG = 30           # free agents snapshotted for the bids database
 _bids_last = {}           # league_id -> ts of last transactions sync
 
 
-# Endgame = still clearly a starter with five weeks left: top-N at the
-# position by full-season projection (Sleeper's season totals, which don't
-# swing with byes and matchups the way weekly numbers do).
+# Endgame = still clearly a starter the rest of the way: top-N at the
+# position by rest-of-season value. Source, in order of preference:
+#   1. a FantasyPros ROS export dropped in rankings/ (see fp_ros_rank)
+#   2. Sleeper's weekly projections summed over the remaining weeks.
+# Not Sleeper's season row: it is a full-season total (18 games for everyone,
+# weeks already played included, injuries ignored) that doesn't move.
 ENDGAME_RANK = {"QB": 12, "RB": 10, "WR": 15, "TE": 5}
-_season_cache = {"ts": 0.0, "rank": {}}
+RANKINGS_DIR = HERE / "rankings"
+LAST_WEEK = 18
+_season_cache = {"ts": 0.0, "rank": {}, "source": ""}
+
+
+def sleeper_ros_rank(players):
+    """({pid: positional rank}, source) from Sleeper's weekly pts_ppr
+    projections summed from the current week through LAST_WEEK."""
+    week = get("/state/nfl").get("week") or 1
+    qs = "&".join(f"position[]={p}" for p in ENDGAME_RANK)
+    weeks = range(week, LAST_WEEK + 1)
+    with ThreadPoolExecutor(8) as ex:
+        tables = list(ex.map(lambda w: get(f"/{CONFIG['season']}/{w}?season_type=regular&{qs}", base=PROJ_BASE), weeks))
+    tot = {}
+    for rows in tables:
+        for row in rows:
+            tot[row["player_id"]] = tot.get(row["player_id"], 0.0) + ((row.get("stats") or {}).get("pts_ppr") or 0.0)
+    by_pos = {}
+    for pid, pts in tot.items():
+        pos = players.get(pid, {}).get("pos")
+        if pos in ENDGAME_RANK:
+            by_pos.setdefault(pos, []).append((pid, pts))
+    rank = {}
+    for lst in by_pos.values():
+        rank.update({pid: i + 1 for i, (pid, _) in enumerate(sorted(lst, key=lambda t: -t[1]))})
+    return rank, f"Sleeper ROS wk{week}–{LAST_WEEK}"
+
+
+def fp_ros_rank(players):
+    """({pid: positional rank}, source) from FantasyPros CSV export(s) in
+    rankings/, or ({}, "") when there are none. Tolerant of both export
+    shapes: rankings (POS like "WR12" carries the positional rank) and
+    projections (FPTS column, ranked within position). Several files are
+    merged, so per-position projection exports work too."""
+    import csv
+    files = sorted(RANKINGS_DIR.glob("*.csv")) if RANKINGS_DIR.exists() else []
+    if not files:
+        return {}, ""
+    # Names -> candidate pids; FantasyPros team codes differ in places.
+    alias = {"JAC": "JAX", "LA": "LAR", "WSH": "WAS"}
+    index = {}
+    for pid, p in players.items():
+        if p.get("pos") in ENDGAME_RANK:
+            index.setdefault(norm(p.get("name", "")), []).append(pid)
+    by_pos, matched, seen = {}, 0, 0
+    for f in files:
+        with f.open(newline="", encoding="utf-8-sig") as fh:
+            rows = list(csv.reader(fh))
+        # The header is the first row naming a player column (exports can
+        # carry a title line above it).
+        hi = next((i for i, r in enumerate(rows) if any(c.strip().upper() in ("PLAYER NAME", "PLAYER", "NAME") for c in r)), None)
+        if hi is None:
+            continue
+        head = [c.strip().upper() for c in rows[hi]]
+        col = lambda *names: next((head.index(n) for n in names if n in head), None)
+        c_name, c_pos, c_team = col("PLAYER NAME", "PLAYER", "NAME"), col("POS", "POSITION"), col("TEAM")
+        c_pts, c_rk = col("FPTS", "FPTS/G", "PTS"), col("RK", "RANK", "ECR")
+        for order, r in enumerate(rows[hi + 1:]):
+            if len(r) <= c_name or not r[c_name].strip():
+                continue
+            name = re.sub(r"\s*\([A-Z]{2,3}\s*-\s*[A-Z]+\)\s*$", "", r[c_name]).strip()   # "Name (TEAM - POS)" form
+            team = r[c_team].strip().upper() if c_team is not None and c_team < len(r) else ""
+            team = alias.get(team, team)
+            pos_raw = r[c_pos].strip().upper() if c_pos is not None and c_pos < len(r) else ""
+            m = re.match(r"([A-Z]+)(\d+)?", pos_raw)
+            seen += 1
+            cands = index.get(norm(name), [])
+            if m:
+                cands = [p for p in cands if players[p].get("pos") == m.group(1)] or cands
+            if team and len(cands) > 1:
+                cands = [p for p in cands if players[p].get("team") == team] or cands
+            cands = sorted(cands, key=lambda p: players[p].get("team") in (None, "", "FA"))
+            if not cands:
+                continue
+            pid = cands[0]
+            pos = players[pid].get("pos")
+            if pos not in ENDGAME_RANK:
+                continue
+            matched += 1
+            if m and m.group(2):
+                key = int(m.group(2))                       # explicit positional rank
+            elif c_pts is not None and c_pts < len(r):
+                try:
+                    key = -float(r[c_pts].replace(",", ""))  # rank by points, high first
+                except ValueError:
+                    key = order
+            else:
+                key = float(r[c_rk]) if c_rk is not None and c_rk < len(r) and r[c_rk].strip() else order
+            by_pos.setdefault(pos, {})[pid] = key
+    rank = {}
+    for d in by_pos.values():
+        rank.update({pid: i + 1 for i, pid in enumerate(sorted(d, key=d.get))})
+    when = time.strftime("%m-%d", time.localtime(max(f.stat().st_mtime for f in files)))
+    return rank, f"FantasyPros ROS {when} ({matched}/{seen} matched)"
 
 
 def season_pos_rank(players):
-    """{pid: rank at position by season-long pts_ppr}. Cached 6h."""
+    """{pid: rest-of-season rank at position}; FantasyPros file if present,
+    else Sleeper's remaining weekly projections. Cached 6h; a failed fetch
+    keeps the previous ranks."""
     if time.time() - _season_cache["ts"] < 6 * 3600 and _season_cache["rank"]:
         return _season_cache["rank"]
-    qs = "&".join(f"position[]={p}" for p in ("QB", "RB", "WR", "TE"))
     try:
-        rows = get(f"/{CONFIG['season']}?season_type=regular&{qs}", base=PROJ_BASE)
-    except Exception:
+        rank, source = fp_ros_rank(players)
+        if not rank:
+            rank, source = sleeper_ros_rank(players)
+    except Exception as e:
+        print("season_pos_rank:", e)
         return _season_cache["rank"]
-    by_pos = {}
-    for row in rows:
-        pid = row["player_id"]
-        pos = players.get(pid, {}).get("pos")
-        if pos in ENDGAME_RANK:
-            by_pos.setdefault(pos, []).append((pid, (row.get("stats") or {}).get("pts_ppr") or 0.0))
-    rank = {}
-    for pos, lst in by_pos.items():
-        for i, (pid, _) in enumerate(sorted(lst, key=lambda t: -t[1])):
-            rank[pid] = i + 1
-    _season_cache.update(ts=time.time(), rank=rank)
-    return rank
+    if rank:
+        _season_cache.update(ts=time.time(), rank=rank, source=source)
+    return _season_cache["rank"]
 
 
 def tier_of(frac, pos=None, season_rank=None):
@@ -1702,6 +1793,7 @@ def waiver_report(lid, as_rid=None):
     # Sort by what the add is worth to this roster, not by raw projection —
     # otherwise streaming QBs crowd out a real upgrade in a 1-QB league.
     cands.sort(key=lambda c: (-c["delta"], -c["proj"]))
+    report["rank_source"] = _season_cache["source"]
     report["candidates_all"] = cands            # for logging; UI shows WAIVER_TOP
     report["candidates"] = cands[:WAIVER_TOP]
     _waiver_cache[(lid, as_rid)] = (time.time(), report)
@@ -2398,7 +2490,7 @@ function waiverSection(pools){
     const shownPos = waivPos[waivLeague];
     const posBar = allPos.map(p => `<label class="lg-item"><input type="checkbox" ${shownPos.has(p) ? 'checked' : ''} onclick="event.stopPropagation();(waivPos['${waivLeague}'].has('${p}') ? waivPos['${waivLeague}'].delete('${p}') : waivPos['${waivLeague}'].add('${p}'));tick()"> ${p}</label>`).join(' ');
     const cands = d.candidates_all.filter(c => shownPos.has(c.pos)).slice(0, 12);
-    body += `<h3>Top free agents · best Δ to your lineup, whole wire screened${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''} &nbsp; <span style="font-weight:400">${posBar}</span></h3>
+    body += `<h3>Top free agents · best Δ to your lineup, whole wire screened · endgame by ${d.rank_source || 'ROS rank'}${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''} &nbsp; <span style="font-weight:400">${posBar}</span></h3>
       <table><tr><th>Player</th><th class="r">Proj</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
       ${cands.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
         <td>${c.name} <span class="pos">${c.pos} ${c.team}</span>${c.tier === 1 ? ` <span class="long" style="font-size:11px">endgame ${c.pos}${c.season_rank}</span>` : (c.tier === 2 ? ` <span class="pos" style="font-size:11px">starter</span>` : '')}${c.chop_pool ? ` <span class="short" style="font-size:11px">chop pool</span>` : ''}</td>
