@@ -1900,6 +1900,21 @@ def backfill_board(lid, run_claims, run_ts, rosters, users, players, con):
     con.commit()
 
 
+def owner_names(lid, users, con):
+    """{roster_id: owner} for every roster in the league, chopped ones too.
+    `rosters` elsewhere is survivors only, which left eliminated bidders as
+    "?". Sleeper keeps owner_id on an emptied roster; if that's ever missing,
+    fall back to the name the calibration log recorded for the roster."""
+    out = {}
+    for r in get(f"/league/{lid}/rosters") or []:
+        name = users.get(r.get("owner_id"))
+        if name:
+            out[r["roster_id"]] = name
+    for rid, name in con.execute("SELECT rid, name FROM teams WHERE league_id=? ORDER BY week", (lid,)).fetchall():
+        out.setdefault(int(rid), name)
+    return out
+
+
 def sync_bids(lid, week, users, rosters, budget):
     """Pull Sleeper's waiver claims for every week so far and upsert them
     with context from the latest snapshot taken before the claim ran."""
@@ -1907,8 +1922,8 @@ def sync_bids(lid, week, users, rosters, budget):
         return
     _bids_last[lid] = time.time()
     players = load_players()
-    rid_owner = {r["roster_id"]: users.get(r.get("owner_id"), f"Roster {r['roster_id']}") for r in rosters}
     con = _db()
+    rid_owner = owner_names(lid, users, con)
     claims = []
     for wk in range(1, week + 1):
         for t in get(f"/league/{lid}/transactions/{wk}") or []:
@@ -1968,7 +1983,7 @@ def sync_bids(lid, week, users, rosters, budget):
                 "WHERE league_id=? AND pid=? ORDER BY ts LIMIT 1", (lid, c["pid"])).fetchone()
         fs, proj, prank, sf, of, tier, srk = snap if snap else (len(rosters), None, None, None, None, None, None)
         p = players.get(c["pid"], {})
-        rows.append((c["tx_id"], CONFIG["season"], week_of(c["ts"]), lid, c["ts"], str(c["rid"]), rid_owner.get(c["rid"], "?"),
+        rows.append((c["tx_id"], CONFIG["season"], week_of(c["ts"]), lid, c["ts"], str(c["rid"]), rid_owner.get(c["rid"], f"Roster {c['rid']}"),
                      c["pid"], p.get("name", c["pid"]), p.get("pos", ""), c["bid"], c["status"],
                      c["dpid"], players.get(c["dpid"], {}).get("name") if c["dpid"] else None,
                      c["faab_before"], round(c["bid"] / c["faab_before"], 4) if c["faab_before"] else None, fs,
@@ -2107,7 +2122,31 @@ def api_bids(lid):
         o["by_tier"] = {str(t or "?"): {"n": len(v), "avg_share": round(100 * sum(v) / len(v), 1)} for t, v in o["by_tier"].items() if v}
         o["avg_over"] = round(sum(o["over"]) / len(o["over"]), 2) if o["over"] else None
         o.pop("over")
-    return jsonify({"runs": out_runs, "owners": sorted(owners.values(), key=lambda o: -o["spent"])})
+    # Price tags: FAAB spent on each player over the season, every time he
+    # clears waivers (dropped, chopped, re-bought). Also across all shared
+    # leagues, for the running cross-league tally.
+    tags = {}
+    for r in sorted(rows, key=lambda r: r["ts"]):
+        if r["winner"] and r["bid"] > 0:
+            t = tags.setdefault(r["pid"], {"name": r["name"], "pos": r["pos"], "total": 0, "buys": []})
+            t["total"] += r["bid"]
+            t["buys"].append({"week": r["week"], "owner": r["owner"], "bid": r["bid"]})
+    con = sqlite3.connect(LOG_DB)
+    everywhere = dict(con.execute(
+        "SELECT pid, SUM(bid) FROM bids WHERE winner=1 AND season=? AND league_id IN (%s) GROUP BY pid"
+        % ",".join("?" * len(CONFIG["shared_leagues"])), (CONFIG["season"], *CONFIG["shared_leagues"])).fetchall())
+    con.close()
+    for pid, t in tags.items():
+        t["all_leagues"] = everywhere.get(pid, t["total"])
+    leaders = sorted(tags.values(), key=lambda t: -t["total"])[:15]
+    try:
+        users = {u["user_id"]: u.get("display_name") for u in get(f"/league/{lid}/users")}
+        out_ = {users.get(r.get("owner_id")) for r in get(f"/league/{lid}/rosters") if not r.get("players")}
+    except Exception:
+        out_ = set()
+    for o in owners.values():
+        o["chopped"] = o["owner"] in out_
+    return jsonify({"runs": out_runs, "owners": sorted(owners.values(), key=lambda o: -o["spent"]), "leaders": leaders})
 
 
 @app.route("/l/<lid>")
@@ -2437,10 +2476,15 @@ function bidsBlock(lid){
       <td class="r num pos">${p.proj == null ? '—' : p.proj.toFixed(1)}</td>
       <td class="r num pos">${p.starts_for == null ? '—' : `${p.starts_for}/${p.of}`}</td>
       <td class="pos" style="padding-left:14px;font-size:12.5px">${p.bids.map(x => `${x.won ? '<b class="long">' : ''}${x.owner} <span class="num">${x.bid}</span>${x.share != null ? `<span style="font-size:11px"> (${(x.share*100).toFixed(0)}%)</span>` : ''}${x.won ? '</b>' : ''}`).join(', ')}</td></tr>`).join('')}</table>`;
+  if (d.leaders && d.leaders.length) html += `<h3>Price tags · FAAB spent on each player this season, every time he clears waivers</h3>
+    <table><tr><th>Player</th><th class="r">Total</th><th style="padding-left:14px">Bought (week · owner · $)</th><th class="r" title="the same player across Paris, Degenerates and Red Queen's">All leagues</th></tr>
+    ${d.leaders.map(t => `<tr><td>${t.name} <span class="pos">${t.pos}</span></td><td class="r num"><b>${t.total}</b></td>
+      <td class="pos" style="padding-left:14px;font-size:12.5px">${t.buys.map(x => `wk${x.week} ${x.owner} <span class="num">${x.bid}</span>`).join(' → ')}</td>
+      <td class="r num pos">${t.all_leagues > t.total ? t.all_leagues : '—'}</td></tr>`).join('')}</table>`;
   html += `<h3>Owner behaviour · all runs · avg share of FAAB bid, by tier</h3>
     <table><tr><th>Owner</th><th class="r">Bids</th><th class="r">Won</th><th class="r">Spent</th><th class="r">Endgame</th><th class="r">Starter</th><th class="r">Fill-in</th><th class="r" title="winning bid / second-highest bid">Overpay ×</th></tr>
     ${d.owners.map(o => `<tr>
-      <td>${o.owner}</td><td class="r num">${o.bids}</td><td class="r num">${o.won}</td><td class="r num">${o.spent}</td>
+      <td>${o.owner}${o.chopped ? ' <span class="short" style="font-size:11px">chopped</span>' : ''}</td><td class="r num">${o.bids}</td><td class="r num">${o.won}</td><td class="r num">${o.spent}</td>
       ${['1','2','3'].map(t => { const v = o.by_tier[t]; return `<td class="r num ${v && v.avg_share >= 15 ? 'short' : 'pos'}">${v ? `${v.avg_share}% <span style="font-size:11px">(${v.n})</span>` : '—'}</td>`; }).join('')}
       <td class="r num pos">${o.avg_over == null ? '—' : o.avg_over.toFixed(2)}</td></tr>`).join('')}</table>`;
   return html;
