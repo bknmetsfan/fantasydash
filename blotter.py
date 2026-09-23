@@ -956,7 +956,7 @@ def log_snapshot(season, week, leagues):
     if not CONFIG["log_seconds"] or time.time() - _log_last["ts"] < CONFIG["log_seconds"]:
         return
     ts = int(time.time())
-    con = sqlite3.connect(LOG_DB)
+    con = connect_log()
     con.executescript("""
         CREATE TABLE IF NOT EXISTS players (
             ts INTEGER, season TEXT, week INTEGER, league_id TEXT, league TEXT,
@@ -1808,8 +1808,17 @@ def waiver_report(lid, as_rid=None):
 # lost, joined to that board (bids). Field size is the season's time axis.
 # ----------------------------------------------------------------------------
 
+def connect_log():
+    """The log DB in WAL mode with a generous busy timeout: the build loop,
+    the waiver/bids sync and page reads all share it from different threads,
+    and a slow backfill transaction was locking readers out."""
+    con = sqlite3.connect(LOG_DB, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
+
+
 def _db():
-    con = sqlite3.connect(LOG_DB)
+    con = connect_log()
     con.executescript("""
         CREATE TABLE IF NOT EXISTS fa_snapshots (
             ts INTEGER, season TEXT, week INTEGER, league_id TEXT, field_size INTEGER,
@@ -2015,7 +2024,7 @@ def api_history(lid):
     season = CONFIG["season"]
     if not LOG_DB.exists():
         return jsonify({"teams": [], "week": week})
-    con = sqlite3.connect(LOG_DB)
+    con = connect_log()
     if week is None:
         week = (con.execute("SELECT MAX(week) FROM players WHERE season=? AND league_id=?", (season, lid)).fetchone()[0]
                 or (_cache["data"] or {}).get("week") or 1)
@@ -2033,7 +2042,7 @@ def api_history(lid):
     missing = {rid for _, rid, *_ in rows} - set(names)
     if missing and not lid.startswith(("espn:", "manual:")):
         fetched = roster_names(lid)
-        con = sqlite3.connect(LOG_DB)
+        con = connect_log()
         con.executemany("INSERT OR REPLACE INTO teams VALUES (?,?,?,?,?)",
                         [(season, week, lid, rid, fetched[rid]) for rid in missing if rid in fetched])
         con.commit()
@@ -2089,7 +2098,7 @@ def api_bids(lid):
     """Last run's results grouped by player, and per-owner behaviour."""
     if not LOG_DB.exists():
         return jsonify({"runs": [], "owners": []})
-    con = sqlite3.connect(LOG_DB)
+    con = connect_log()
     con.row_factory = sqlite3.Row
     rows = [dict(r) for r in con.execute(
         "SELECT * FROM bids WHERE league_id=? ORDER BY ts DESC, pid, bid DESC", (lid,)).fetchall()]
@@ -2131,7 +2140,7 @@ def api_bids(lid):
             t = tags.setdefault(r["pid"], {"name": r["name"], "pos": r["pos"], "total": 0, "buys": []})
             t["total"] += r["bid"]
             t["buys"].append({"week": r["week"], "owner": r["owner"], "bid": r["bid"]})
-    con = sqlite3.connect(LOG_DB)
+    con = connect_log()
     everywhere = dict(con.execute(
         "SELECT pid, SUM(bid) FROM bids WHERE winner=1 AND season=? AND league_id IN (%s) GROUP BY pid"
         % ",".join("?" * len(CONFIG["shared_leagues"])), (CONFIG["season"], *CONFIG["shared_leagues"])).fetchall())
