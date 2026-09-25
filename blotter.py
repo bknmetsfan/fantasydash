@@ -952,8 +952,19 @@ def load_espn(week, players, games, stats):
 # eliminator distribution after a few weeks.
 # ----------------------------------------------------------------------------
 
+LOG_IDLE_SECONDS = 3600    # snapshot cadence when no game is in progress
+
+
 def log_snapshot(season, week, leagues):
+    """Calibration snapshot: every player's act/proj/rem, per league. Every
+    log_seconds while a game is in progress, hourly otherwise — logging
+    around the clock filled the volume (~55 MB/day) with identical rows."""
     if not CONFIG["log_seconds"] or time.time() - _log_last["ts"] < CONFIG["log_seconds"]:
+        return
+    live = any(0 < r[-1] < 1 for lg in leagues for r in lg.get("_log", []))
+    if not live and time.time() - _log_last["ts"] < LOG_IDLE_SECONDS:
+        for lg in leagues:
+            lg.pop("_log", None)
         return
     ts = int(time.time())
     con = connect_log()
@@ -971,7 +982,7 @@ def log_snapshot(season, week, leagues):
             ts INTEGER, season TEXT, week INTEGER, league_id TEXT, league TEXT, mode TEXT,
             my_points REAL, my_proj REAL, pct REAL, sens REAL, rank INTEGER, field_size INTEGER,
             to_play INTEGER, live INTEGER);
-    """)
+    """ + TEAM_SNAPS_DDL)
     prow, lrow, trow = [], [], []
     for lg in leagues:
         if lg["mode"] == "error":
@@ -989,11 +1000,32 @@ def log_snapshot(season, week, leagues):
                      lg.get("survive_pct", lg.get("win_pct")), lg.get("sens"),
                      lg.get("rank"), lg.get("field_size"), tp[0], tp[1]))
     con.executemany("INSERT INTO players VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", prow)
+    con.executemany("INSERT OR REPLACE INTO team_snaps VALUES (?,?,?,?,?,?,?)", team_rows(prow))
     con.executemany("INSERT INTO leagues VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lrow)
     con.executemany("INSERT OR REPLACE INTO teams VALUES (?,?,?,?,?)", trow)
     con.commit()
     con.close()
     _log_last["ts"] = time.time()
+
+
+# Per-team totals per snapshot, so the chart never sums the players table.
+TEAM_SNAPS_DDL = """
+        CREATE TABLE IF NOT EXISTS team_snaps (
+            season TEXT, week INTEGER, league_id TEXT, ts INTEGER, rid TEXT, pts REAL, proj REAL,
+            PRIMARY KEY (season, league_id, week, ts, rid));
+        CREATE INDEX IF NOT EXISTS leagues_lg ON leagues (league_id, week);
+"""
+
+
+def team_rows(prow):
+    """players rows (ts, season, week, lid, league, rid, mine, pid, name, pos,
+    team, act, proj, rem) -> team_snaps rows with live pts and blended final."""
+    agg = {}
+    for ts, season, week, lid, _, rid, _, _, _, _, _, act, proj, rem in prow:
+        a = agg.setdefault((season, week, lid, ts, rid), [0.0, 0.0])
+        a[0] += act
+        a[1] += act + proj * rem
+    return [(se, wk, lid, ts, rid, round(p, 2), round(f, 2)) for (se, wk, lid, ts, rid), (p, f) in agg.items()]
 
 
 def log_rows(rid, mine, det, players):
@@ -2024,15 +2056,48 @@ def api_history(lid):
     season = CONFIG["season"]
     if not LOG_DB.exists():
         return jsonify({"teams": [], "week": week})
+    hit = _hist_cache.get((lid, week))
+    if hit and time.time() - hit[0] < (90 if week is None or week == (_cache["data"] or {}).get("week") else 86400):
+        return jsonify(hit[1])
+    # One build at a time, and nobody queues behind it: waiting requests get
+    # the stale copy (or an empty chart) instead of pinning a worker thread.
+    if not _hist_lock.acquire(blocking=False):
+        return jsonify(hit[1] if hit else {"week": week, "weeks": [], "league_id": lid, "teams": [], "building": True})
+    try:
+        payload = history_payload(lid, week, season)
+        _hist_cache[(lid, week)] = (time.time(), payload)
+    finally:
+        _hist_lock.release()
+    return jsonify(payload)
+
+
+_hist_cache = {}
+_hist_lock = threading.Lock()
+
+
+def history_payload(lid, week, season):
     con = connect_log()
-    if week is None:
-        week = (con.execute("SELECT MAX(week) FROM players WHERE season=? AND league_id=?", (season, lid)).fetchone()[0]
-                or (_cache["data"] or {}).get("week") or 1)
-    weeks = [w for (w,) in con.execute("SELECT DISTINCT week FROM players WHERE season=? AND league_id=? ORDER BY week",
+    try:
+        con.executescript(TEAM_SNAPS_DDL)
+    except sqlite3.OperationalError:          # nothing logged yet
+        con.close()
+        return {"week": week, "weeks": [], "league_id": lid, "teams": []}
+    weeks = [w for (w,) in con.execute("SELECT DISTINCT week FROM leagues WHERE season=? AND league_id=? ORDER BY week",
                                        (season, lid)).fetchall()]
-    rows = con.execute(
-        "SELECT ts, rid, ROUND(SUM(act), 2), ROUND(SUM(act + proj * rem), 2) FROM players "
-        "WHERE season=? AND week=? AND league_id=? GROUP BY ts, rid ORDER BY ts", (season, week, lid)).fetchall()
+    if week is None:
+        week = (weeks[-1] if weeks else None) or (_cache["data"] or {}).get("week") or 1
+    rows = con.execute("SELECT ts, rid, pts, proj FROM team_snaps WHERE season=? AND league_id=? AND week=? ORDER BY ts",
+                       (season, lid, week)).fetchall()
+    if not rows:
+        # Weeks logged before team_snaps existed: aggregate the players table
+        # once and keep the result.
+        raw = con.execute(
+            "SELECT ts, rid, ROUND(SUM(act), 2), ROUND(SUM(act + proj * rem), 2) FROM players "
+            "WHERE season=? AND week=? AND league_id=? GROUP BY ts, rid ORDER BY ts", (season, week, lid)).fetchall()
+        con.executemany("INSERT OR REPLACE INTO team_snaps VALUES (?,?,?,?,?,?,?)",
+                        [(season, week, lid, ts, rid, p, f) for ts, rid, p, f in raw])
+        con.commit()
+        rows = raw
     names = dict(con.execute("SELECT rid, name FROM teams WHERE season=? AND week=? AND league_id=?",
                              (season, week, lid)).fetchall())
     con.close()
@@ -2082,7 +2147,7 @@ def api_history(lid):
               "series": v[::step] + ([v[-1]] if (len(v) - 1) % step else [])}
              for rid, v in series.items()]
     teams.sort(key=lambda t: -t["series"][-1][2])
-    return jsonify({"week": week, "weeks": weeks, "league_id": lid, "mode": (live or {}).get("mode"), "teams": teams})
+    return {"week": week, "weeks": weeks, "league_id": lid, "mode": (live or {}).get("mode"), "teams": teams}
 
 
 @app.route("/api/waivers/<lid>")
