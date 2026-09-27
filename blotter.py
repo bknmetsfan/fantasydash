@@ -51,6 +51,9 @@ CONFIG = {
     "pending_chop": {},          # e.g. {"1389721132256473088": "kickersvingames"}
     # Default league for the waiver and chart sections.
     "favorite_league": "1400335104223485952",   # Paris in 1795v2
+    # Pools that pay the week's high score: league_id -> $ per week (None =
+    # amount unknown, just count wins).
+    "weekly_prize": {"1400335104223485952": None},   # Paris
     "shared_leagues": [
         "1400335104223485952",   # Paris in 1795v2
         "1389721132256473088",   # Degenerates
@@ -1035,6 +1038,43 @@ def log_rows(rid, mine, det, players):
             for pid, d in det.items()]
 
 
+_prize_weeks = {}          # (league_id, week) -> that week's final scores; completed weeks only
+
+
+def weekly_prize(lid, week, field):
+    """The week's-high-score side game: every completed week's top scorer
+    (from Sleeper's matchups, so chopped teams count for the weeks they
+    played), the season tally, and this week's live and projected leader."""
+    names = roster_names(lid)
+    amount = CONFIG["weekly_prize"].get(lid)
+    weeks = []
+    for w in range(1, week):
+        if (lid, w) not in _prize_weeks:
+            pts = {str(m["roster_id"]): m["points"] for m in get(f"/league/{lid}/matchups/{w}") or [] if m.get("points")}
+            if not pts:
+                continue
+            _prize_weeks[(lid, w)] = pts
+        pts = _prize_weeks[(lid, w)]
+        ranked = sorted(pts.items(), key=lambda kv: -kv[1])
+        weeks.append({"week": w, "rid": ranked[0][0], "name": names.get(ranked[0][0], f"Roster {ranked[0][0]}"),
+                      "pts": round(ranked[0][1], 2),
+                      "margin": round(ranked[0][1] - ranked[1][1], 2) if len(ranked) > 1 else None,
+                      "scores": {rid: round(p, 2) for rid, p in pts.items()}})
+    tally = {}
+    for w in weeks:
+        t = tally.setdefault(w["name"], {"name": w["name"], "wins": 0, "weeks": []})
+        t["wins"] += 1
+        t["weeks"].append(w["week"])
+    for t in tally.values():
+        t["won"] = t["wins"] * amount if amount else None
+    live = max(field, key=lambda f: f["pts"])
+    proj = max(field, key=lambda f: f["proj"])
+    return {"amount": amount, "weeks": weeks,
+            "tally": sorted(tally.values(), key=lambda t: (-t["wins"], t["weeks"][0])),
+            "leader": {"name": live["name"], "pts": live["pts"]},
+            "proj_leader": {"name": proj["name"], "proj": proj["proj"], "top_pct": proj.get("top_pct")}}
+
+
 def shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats):
     """
     Every team's seat in a guillotine league, each shaped like our own pool
@@ -1062,6 +1102,7 @@ def shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats):
             "above": field[li + 1] if li + 1 < n else None,
             "proj_rank": n - pi, "proj_margin": pmargin, "proj_ref": pref,
             "survive_pct": round(100 - f["chop_pct"], 1),
+            "top_pct": f.get("top_pct"),
             "sens": point_value(sims[rid], np.min(others, axis=0)),
             "lineup": lineup_rows(det, players, stats),
             "ref_lineup": lineup_rows(proj_by_rid[pref["rid"]][2], players, stats),
@@ -1075,7 +1116,7 @@ def shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats):
     for e in feed:                      # the "_" tag was only for pricing
         for pp in e["players"]:
             pp["for"] = []
-    return {"teams": teams, "feed": feed, "field": field}
+    return {"teams": teams, "feed": feed, "field": field, "prize": entry.get("prize")}
 
 
 # ----------------------------------------------------------------------------
@@ -1236,14 +1277,20 @@ def build():
             share = np.bincount(mat.argmin(axis=0), minlength=len(field)) / mat.shape[1]
             for f, c in zip(field, share):
                 f["chop_pct"] = round(100 * float(c), 1)
+            top = np.bincount(mat.argmax(axis=0), minlength=len(field)) / mat.shape[1]
+            for f, c in zip(field, top):
+                f["top_pct"] = round(100 * float(c), 1)
             entry.update({
                 "proj_rank": len(field) - prank,
                 "proj_margin": pmargin,
                 "proj_ref": pref,
                 "proj_chop_target": pfield[0],
                 "survive_pct": round(100 - field[rank]["chop_pct"], 1),
+                "top_pct": field[rank]["top_pct"],
                 "ref_lineup": lineup_rows(proj_by_rid[pref["rid"]][2], players, stats),
             })
+            if lid in CONFIG["weekly_prize"]:
+                entry["prize"] = weekly_prize(lid, week, field)
             if lid in CONFIG["shared_leagues"]:
                 entry["shared"] = shared_pool_view(entry, field, pfield, sims, proj_by_rid, players, stats)
 
@@ -1488,7 +1535,7 @@ def api_league(lid):
         return jsonify({"error": "league not found"}), 404
     return jsonify({"week": data["week"], "updated": data["updated"], "stale": data.get("stale"),
                     "name": lg["name"], "teams": lg["shared"]["teams"], "feed": lg["shared"]["feed"],
-                    "field": lg["shared"]["field"]})
+                    "field": lg["shared"]["field"], "prize": lg["shared"].get("prize")})
 
 
 _roster_names = {}
@@ -2631,18 +2678,20 @@ function poolDetail(l){
   const proj = [...l.field].sort((a,b) => b.proj - a.proj);
   return `<div class="detail">
     <h3>Field · by proj final (chop line above the last row) · live rank in grey</h3>
-    <table><tr><th class="rk">#</th><th>Team</th><th class="r">Chop %</th><th class="r">Proj final</th><th class="r">Pts</th><th class="r">To play</th><th class="r">Live #</th></tr>
+    <table><tr><th class="rk">#</th><th>Team</th><th class="r">Chop %</th>${l.prize ? '<th class="r" title="share of sims with the week\'s high score">Top %</th>' : ''}<th class="r">Proj final</th><th class="r">Pts</th><th class="r">To play</th><th class="r">Live #</th></tr>
     ${proj.map((t,i) => {
       const key = `team:${l.league_id}:${t.rid}`, isOpen = open.has(key);
       return `<tr class="${t.rid === me ? 'me' : ''} ${i === n - 2 ? 'line' : ''} trow" onclick="event.stopPropagation();toggle('${key}')">
       <td class="rk num">${i+1}</td><td><span class="caret">${isOpen ? '▾' : '▸'}</span> ${t.name}</td>
       <td class="r num ${t.chop_pct >= 15 ? 'short' : ''}">${Math.round(t.chop_pct)}</td>
+      ${l.prize ? `<td class="r num ${t.top_pct >= 15 ? 'long' : 'pos'}">${t.top_pct == null ? '—' : Math.round(t.top_pct)}</td>` : ''}
       <td class="r num">${f2(t.proj)}</td><td class="r num">${f2(t.pts)}</td>
       <td class="r num pos">${t.to_play[0]}${t.to_play[1] ? `<span style="color:var(--warn)"> ·${t.to_play[1]}</span>` : ''}</td>
       <td class="r num pos">${lrank[t.rid]}</td></tr>
-      ${isOpen && t.lineup ? `<tr class="tdetail"><td colspan="7">${lineupTable(t.name, t.lineup)}</td></tr>` : ''}`;
+      ${isOpen && t.lineup ? `<tr class="tdetail"><td colspan="${l.prize ? 8 : 7}">${lineupTable(t.name, t.lineup)}</td></tr>` : ''}`;
     }).join('')}
     </table>
+    ${l.prize ? prizeBlock(l) : ''}
     ${lineupTable('Your lineup', l.lineup)}
     ${benchBlock(l)}
     ${lineupTable(`${l.proj_ref.name}`, l.ref_lineup)}
@@ -2674,6 +2723,21 @@ function h2hDetail(l){
     </table></div>`;
 }
 
+function prizeBlock(l){
+  // Week's-high-score side game: this week's leader, every past winner, the tally.
+  const p = l.prize, me = String(l.my_rid);
+  const money = n => p.amount ? ` · $${n}` : '';
+  const rows = p.weeks.map(w => {
+    const mine = w.scores[me], rank = mine == null ? null : Object.values(w.scores).filter(v => v > mine).length + 1;
+    return `<tr class="${w.rid === me ? 'me' : ''}"><td class="num">${w.week}</td><td>${w.name}</td><td class="r num">${f2(w.pts)}</td>
+      <td class="r num pos">${w.margin == null ? '—' : '+' + f2(w.margin)}</td>
+      <td class="r num pos">${mine == null ? '—' : `${f2(mine)} <span style="font-size:11px">(#${rank} of ${Object.keys(w.scores).length})</span>`}</td></tr>`;
+  }).join('');
+  return `<h3>Weekly high score${p.amount ? ` · $${p.amount} a week` : ''} · leading now: ${p.leader.name} ${f2(p.leader.pts)} · projected: ${p.proj_leader.name} ${f2(p.proj_leader.proj)}</h3>
+    ${p.weeks.length ? `<table><tr><th>Wk</th><th>Winner</th><th class="r">Pts</th><th class="r">Over 2nd</th><th class="r">${l.team ? l.team : 'You'}</th></tr>${rows}</table>
+    <div class="pos" style="font-size:12.5px;margin:4px 0 10px">Season: ${p.tally.map(t => `${t.name} ×${t.wins}${money(t.won)}`).join(' · ')}</div>` : '<div class="pos">No completed weeks yet.</div>'}`;
+}
+
 function chopCard(l){
   const m = l.margin, size = l.field_size;
   const cls = m <= 0 ? 'danger' : (m < 8 ? 'thin' : '');
@@ -2692,7 +2756,7 @@ function chopCard(l){
       <span class="num r1"><span class="big ${mc}">${m > 0 ? '+' : ''}${m.toFixed(2)}</span> <span class="pos">${verdict} · you ${l.my_points.toFixed(2)}</span></span>
     </div>
     <div class="l2 num pos">
-      <span><span class="${pctCls(l.survive_pct)}">survive ${Math.round(l.survive_pct)}%</span> · ${l.sens.toFixed(2)}%/pt · ${l.my_to_play[0]} v ${pr.to_play[0]} to play</span>
+      <span><span class="${pctCls(l.survive_pct)}">survive ${Math.round(l.survive_pct)}%</span>${l.prize ? ` · <span title="share of sims in which you post the week's high score">top score ${l.top_pct < 1 && l.top_pct > 0 ? '<1' : Math.round(l.top_pct)}%</span>` : ''} · ${l.sens.toFixed(2)}%/pt · ${l.my_to_play[0]} v ${pr.to_play[0]} to play</span>
       <span>${nb.join(' ')} · proj final ${l.my_proj.toFixed(2)} · ${projLine}</span>
     </div>
   </div>${open.has(l.league_id) ? poolDetail(l) : ''}`;
@@ -2777,7 +2841,7 @@ function bookRows(book){
 
 function leagueTick(d){
   // Leaguemate view: pick a team, see the chop picture from that seat.
-  d.teams.forEach(t => { t.field = d.field; });
+  d.teams.forEach(t => { t.field = d.field; t.prize = d.prize; });
   const key = 'team:' + LEAGUE_ID;
   const fromUrl = new URLSearchParams(location.search).get('team');
   let rid = fromUrl || (() => { try { return localStorage.getItem(key); } catch(e){ return null; } })();
