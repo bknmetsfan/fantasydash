@@ -3,30 +3,18 @@
     "name": "Eliminator.gg",
     "scoring": "eliminator",
     "starters": [
-      "Jayden Daniels",
-      "Kenneth Walker",
+      "Brock Purdy",
+      "Quinshon Judkins",
+      "De'Von Achane",
+      "Garrett Wilson",
+      "KC Concepcion",
+      "Devaughn Vele",
+      "George Kittle",
       {
-        "name": "Breece Hall",
-        "mult": 1.5
-      },
-      "Antonio Williams",
-      {
-        "name": "Drake London",
-        "mult": 1.5
-      },
-      {
-        "name": "Chris Godwin",
-        "mult": 1.5
-      },
-      {
-        "name": "Colston Loveland",
-        "mult": 1.5
-      },
-      {
-        "name": "Bijan Robinson",
+        "name": "Jahmyr Gibbs",
         "mult": 1.5
       }
     ],
-    "week": 2
+    "week": 3
   }
 ]
