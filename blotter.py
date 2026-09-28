@@ -1336,9 +1336,17 @@ def build():
                   "l": (r.get("settings") or {}).get("losses", 0),
                   "t": (r.get("settings") or {}).get("ties", 0),
                   "pf": round((r.get("settings") or {}).get("fpts", 0)
-                              + (r.get("settings") or {}).get("fpts_decimal", 0) / 100, 2)}
+                              + (r.get("settings") or {}).get("fpts_decimal", 0) / 100, 2),
+                  # Max PF (Sleeper's "potential points", optimal lineup every
+                  # completed week): the draft-order tiebreak for non-playoff
+                  # teams in Dynasty Degenrates. Same as PF in best ball.
+                  "max_pf": None if best_ball else round((r.get("settings") or {}).get("ppts", 0)
+                                                         + (r.get("settings") or {}).get("ppts_decimal", 0) / 100, 2)}
                  for r in rosters],
                 key=lambda x: (-x["w"], -x["pf"]))
+            ranked = sorted((t for t in entry["standings"] if t["max_pf"] is not None), key=lambda t: -t["max_pf"])
+            for i, t in enumerate(ranked):
+                t["max_pf_rank"] = i + 1
             entry["my_rid"] = my_rid
             if opp_m:
                 entry["opp_name"] = team_name(opp_m["roster_id"])
@@ -2716,10 +2724,12 @@ function h2hDetail(l){
     <h3>This week · pts, proj final · win % for the left team</h3>
     <table>${(l.matchups || []).map(p => p.length === 2 ? row(p[0], p[1]) : '').join('')}</table>
     <h3>Standings</h3>
-    <table><tr><th class="rk">#</th><th>Team</th><th class="r">W-L</th><th class="r">PF</th></tr>
+    ${(() => { const mx = (l.standings || []).some(t => t.max_pf != null); return `
+    <table><tr><th class="rk">#</th><th>Team</th><th class="r">W-L</th><th class="r">PF</th>${mx ? '<th class="r" title="optimal lineup every completed week; rank in grey">Max PF</th>' : ''}</tr>
     ${(l.standings || []).map((t,i) => `<tr class="${t.rid === me ? 'me' : ''}">
       <td class="rk num">${i+1}</td><td>${t.name}</td>
-      <td class="r num">${t.w}-${t.l}${t.t ? '-' + t.t : ''}</td><td class="r num">${f2(t.pf)}</td></tr>`).join('')}
+      <td class="r num">${t.w}-${t.l}${t.t ? '-' + t.t : ''}</td><td class="r num">${f2(t.pf)}</td>
+      ${mx ? `<td class="r num">${t.max_pf == null ? '—' : `${f2(t.max_pf)} <span class="pos" style="font-size:11px">#${t.max_pf_rank}</span>`}</td>` : ''}</tr>`).join('')}`; })()}
     </table></div>`;
 }
 
