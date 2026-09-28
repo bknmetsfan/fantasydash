@@ -314,6 +314,33 @@ def lineup_rows(det, players, stats):
     return rows
 
 
+def median_game(entry, matchups, sims, my_rid, proj_by_rid):
+    """Leagues that also play everyone against the league median (Sleeper's
+    league_average_match): the top half of scores each week get a second
+    win. Adds each team's chance of that win, the projected median line,
+    expected wins out of 2, and folds the median game into my per-point
+    value so the exposure book counts both games."""
+    rids = [m["roster_id"] for m in matchups if m["roster_id"] in sims]
+    if len(rids) < 2:
+        return
+    half = len(rids) // 2
+    mat = np.array([sims[r] for r in rids])
+    rank = (-mat).argsort(axis=0).argsort(axis=0)          # 0 = top score in that draw
+    med = {r: round(100 * float(np.mean(rank[i] < half)), 1) for i, r in enumerate(rids)}
+    for pair in entry.get("matchups") or []:
+        for side in pair:
+            side["median_pct"] = med.get(side["rid"])
+    finals = sorted((sum(proj_by_rid[r][1].values()) for r in rids), reverse=True)
+    entry["median_proj"] = round((finals[half - 1] + finals[half]) / 2 if len(finals) % 2 == 0 else finals[half], 2)
+    entry["median_pct"] = med.get(my_rid)
+    if my_rid in sims and entry.get("win_pct") is not None:
+        # I take the median win when I beat the half-th best of the others.
+        others = np.array([sims[r] for r in rids if r != my_rid])
+        line = -np.sort(-others, axis=0)[half - 1]
+        entry["sens"] = round(entry["sens"] + point_value(sims[my_rid], line), 3)
+        entry["exp_wins"] = round((entry["win_pct"] + entry["median_pct"]) / 100, 2)
+
+
 def point_value(me, others, delta=2.0):
     """
     Percentage points of P(me beats `others`) gained per extra fantasy point
@@ -1362,6 +1389,8 @@ def build():
                 entry["opp_starters_proj"] = opp_proj
                 entry["margin"] = round(entry["my_points"] - entry["opp_points"], 2)
                 entry["proj_margin"] = round(entry["my_proj"] - entry["opp_proj"], 2)
+            if (lg.get("settings") or {}).get("league_average_match"):
+                median_game(entry, matchups, sims, my_rid, proj_by_rid)
 
         out_leagues.append(entry)
 
@@ -2708,20 +2737,21 @@ function poolDetail(l){
 
 function h2hDetail(l){
   const me = l.my_rid;
+  const med = t => t.median_pct == null ? '' : ` <span style="font-size:11px" title="chance of a top-half score">m${Math.round(t.median_pct)}%</span>`;
   const row = (a,b) => {
     const lead = a.pts - b.pts, plead = a.proj - b.proj;
     const cls = x => x > 0 ? 'long' : (x < 0 ? 'short' : '');
     return `<tr class="${a.rid === me || b.rid === me ? 'me' : ''}">
-      <td>${a.name}</td><td class="r num ${cls(lead)}">${f2(a.pts)}</td><td class="r num pos">${f2(a.proj)}</td>
+      <td>${a.name}</td><td class="r num ${cls(lead)}">${f2(a.pts)}</td><td class="r num pos">${f2(a.proj)}${med(a)}</td>
       <td class="pos" style="padding:3px 10px">v</td>
-      <td>${b.name}</td><td class="r num ${cls(-lead)}">${f2(b.pts)}</td><td class="r num pos">${f2(b.proj)}</td>
+      <td>${b.name}</td><td class="r num ${cls(-lead)}">${f2(b.pts)}</td><td class="r num pos">${f2(b.proj)}${med(b)}</td>
       <td class="r num pos">${a.win_pct === undefined ? '' : `${Math.round(a.win_pct)}%`}</td></tr>`;
   };
   return `<div class="detail">
     ${lineupTable('Your lineup', l.lineup)}
     ${benchBlock(l)}
     ${lineupTable(l.opp_name ?? 'Opponent', l.opp_lineup)}
-    <h3>This week · pts, proj final · win % for the left team</h3>
+    <h3>This week · pts, proj final · win % for the left team${l.median_proj == null ? '' : ` · median game: top half win, line ≈ ${f2(l.median_proj)} proj · m% = chance of a top-half score`}</h3>
     <table>${(l.matchups || []).map(p => p.length === 2 ? row(p[0], p[1]) : '').join('')}</table>
     <h3>Standings</h3>
     ${(() => { const mx = (l.standings || []).some(t => t.max_pf != null); return `
@@ -2780,7 +2810,7 @@ function h2hRow(l){
     <span class="num"><span class="${c}">${m >= 0 ? '+' : ''}${m.toFixed(2)}</span>
       &nbsp;<span class="pos">${l.my_points.toFixed(2)} – ${(l.opp_points ?? 0).toFixed(2)}</span>
       ${pm === null ? '' : `&nbsp;<span class="pos">· proj final <span class="${pm >= 0 ? 'long' : 'short'}">${pm >= 0 ? '+' : ''}${pm.toFixed(2)}</span> (${l.my_proj.toFixed(2)} – ${l.opp_proj.toFixed(2)})</span>`}
-      ${l.win_pct === undefined ? '' : `&nbsp;<span class="${pctCls(l.win_pct)}">win ${Math.round(l.win_pct)}%</span> <span class="pos">· ${l.sens.toFixed(2)}%/pt${l.weight !== 1 ? ` · w${l.weight}` : ''} · ${l.my_to_play[0]} v ${l.opp_to_play[0]} to play</span>`}</span>
+      ${l.win_pct === undefined ? '' : `&nbsp;<span class="${pctCls(l.win_pct)}">win ${Math.round(l.win_pct)}%</span>${l.median_pct == null ? '' : ` <span class="pos">·</span> <span class="${pctCls(l.median_pct)}" title="chance of finishing in the top half of scores this week">median ${Math.round(l.median_pct)}%</span> <span class="pos">· <b>${l.exp_wins.toFixed(1)}</b> of 2 exp W</span>`} <span class="pos">· ${l.sens.toFixed(2)}%/pt${l.weight !== 1 ? ` · w${l.weight}` : ''} · ${l.my_to_play[0]} v ${l.opp_to_play[0]} to play</span>`}</span>
   </div>${open.has(l.league_id) ? h2hDetail(l) : ''}`;
 }
 
