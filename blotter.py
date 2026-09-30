@@ -1584,124 +1584,133 @@ _bids_last = {}           # league_id -> ts of last transactions sync
 
 
 # Endgame = still clearly a starter the rest of the way: top-N at the
-# position by rest-of-season value. Source, in order of preference:
-#   1. a FantasyPros ROS export dropped in rankings/ (see fp_ros_rank)
-#   2. Sleeper's weekly projections summed over the remaining weeks.
-# Not Sleeper's season row: it is a full-season total (18 games for everyone,
-# weeks already played included, injuries ignored) that doesn't move.
+# position by rest-of-season value, blended across sources:
+#   - Sleeper: weekly projections summed from the current week to LAST_WEEK
+#   - any export dropped in rankings/, one source per filename prefix
+#     (fanduel_ros_2026-09-29_qb.csv + fanduel_ros_2026-09-29_flex.csv -> "fanduel")
+# The blend is each player's mean positional rank across the sources that
+# list him, re-ranked. Not Sleeper's season row: a frozen full-season total
+# (18 games for everyone, played weeks included, injuries ignored).
 ENDGAME_RANK = {"QB": 12, "RB": 10, "WR": 15, "TE": 5}
 RANKINGS_DIR = HERE / "rankings"
 LAST_WEEK = 18
-_season_cache = {"ts": 0.0, "rank": {}, "source": ""}
+_ros_cache = {"ts": 0.0, "table": None}
+SOURCE_NAMES = {"fanduel": "FanDuel", "fantasypros": "FantasyPros", "sleeper": "Sleeper"}
 
 
-def sleeper_ros_rank(players):
-    """({pid: positional rank}, source) from Sleeper's weekly pts_ppr
-    projections summed from the current week through LAST_WEEK."""
+def sleeper_ros(players):
+    """{pid: half-PPR points} from Sleeper's weekly projections, current week
+    through LAST_WEEK, and a label."""
     week = get("/state/nfl").get("week") or 1
     qs = "&".join(f"position[]={p}" for p in ENDGAME_RANK)
-    weeks = range(week, LAST_WEEK + 1)
     with ThreadPoolExecutor(8) as ex:
-        tables = list(ex.map(lambda w: get(f"/{CONFIG['season']}/{w}?season_type=regular&{qs}", base=PROJ_BASE), weeks))
+        tables = list(ex.map(lambda w: get(f"/{CONFIG['season']}/{w}?season_type=regular&{qs}", base=PROJ_BASE),
+                             range(week, LAST_WEEK + 1)))
     tot = {}
     for rows in tables:
         for row in rows:
-            tot[row["player_id"]] = tot.get(row["player_id"], 0.0) + ((row.get("stats") or {}).get("pts_ppr") or 0.0)
-    by_pos = {}
-    for pid, pts in tot.items():
-        pos = players.get(pid, {}).get("pos")
-        if pos in ENDGAME_RANK:
-            by_pos.setdefault(pos, []).append((pid, pts))
-    rank = {}
-    for lst in by_pos.values():
-        rank.update({pid: i + 1 for i, (pid, _) in enumerate(sorted(lst, key=lambda t: -t[1]))})
-    return rank, f"Sleeper ROS wk{week}–{LAST_WEEK}"
+            tot[row["player_id"]] = tot.get(row["player_id"], 0.0) + ((row.get("stats") or {}).get("pts_half_ppr") or 0.0)
+    return tot, f"Sleeper wk{week}–{LAST_WEEK}"
 
 
-def fp_ros_rank(players):
-    """({pid: positional rank}, source) from FantasyPros CSV export(s) in
-    rankings/, or ({}, "") when there are none. Tolerant of both export
-    shapes: rankings (POS like "WR12" carries the positional rank) and
-    projections (FPTS column, ranked within position). Several files are
-    merged, so per-position projection exports work too."""
+def file_ros(players):
+    """{source: ({pid: pts or None}, {pid: explicit positional rank}, label)}
+    from the CSVs in rankings/. Tolerates FanDuel Research's remaining-season
+    export (player, full team name, 'fantasy'), FantasyPros rankings (POS like
+    'WR12') and FantasyPros projections (FPTS)."""
     import csv
     files = sorted(RANKINGS_DIR.glob("*.csv")) if RANKINGS_DIR.exists() else []
-    if not files:
-        return {}, ""
-    # Names -> candidate pids; FantasyPros team codes differ in places.
-    alias = {"JAC": "JAX", "LA": "LAR", "WSH": "WAS"}
     index = {}
     for pid, p in players.items():
         if p.get("pos") in ENDGAME_RANK:
             index.setdefault(norm(p.get("name", "")), []).append(pid)
-    by_pos, matched, seen = {}, 0, 0
+    alias = {"JAC": "JAX", "LA": "LAR", "WSH": "WAS"}
+    out = {}
     for f in files:
+        key = f.stem.split("_")[0].lower()
+        pts, ranks, label = out.setdefault(key, ({}, {}, None))
+        date = re.search(r"(\d{4})-(\d{2})-(\d{2})", f.stem)
+        label = f"{SOURCE_NAMES.get(key, key.title())} {date.group(2)}-{date.group(3)}" if date else SOURCE_NAMES.get(key, key.title())
+        out[key] = (pts, ranks, label)
         with f.open(newline="", encoding="utf-8-sig") as fh:
             rows = list(csv.reader(fh))
-        # The header is the first row naming a player column (exports can
-        # carry a title line above it).
         hi = next((i for i, r in enumerate(rows) if any(c.strip().upper() in ("PLAYER NAME", "PLAYER", "NAME") for c in r)), None)
         if hi is None:
             continue
         head = [c.strip().upper() for c in rows[hi]]
         col = lambda *names: next((head.index(n) for n in names if n in head), None)
         c_name, c_pos, c_team = col("PLAYER NAME", "PLAYER", "NAME"), col("POS", "POSITION"), col("TEAM")
-        c_pts, c_rk = col("FPTS", "FPTS/G", "PTS"), col("RK", "RANK", "ECR")
-        for order, r in enumerate(rows[hi + 1:]):
+        c_pts = col("FPTS", "FANTASY", "PTS")
+        for r in rows[hi + 1:]:
             if len(r) <= c_name or not r[c_name].strip():
                 continue
-            name = re.sub(r"\s*\([A-Z]{2,3}\s*-\s*[A-Z]+\)\s*$", "", r[c_name]).strip()   # "Name (TEAM - POS)" form
-            team = r[c_team].strip().upper() if c_team is not None and c_team < len(r) else ""
-            team = alias.get(team, team)
-            pos_raw = r[c_pos].strip().upper() if c_pos is not None and c_pos < len(r) else ""
-            m = re.match(r"([A-Z]+)(\d+)?", pos_raw)
-            seen += 1
-            cands = index.get(norm(name), [])
+            name = re.sub(r"\s*\([A-Z]{2,3}\s*-\s*[A-Z]+\)\s*$", "", r[c_name]).strip()
+            cands = index.get(norm(name)) or index.get(norm(re.sub(r"\s+(II|Sr\.)$", "", name)), [])
+            m = re.match(r"([A-Z]+)(\d+)?", r[c_pos].strip().upper()) if c_pos is not None and c_pos < len(r) else None
             if m:
                 cands = [p for p in cands if players[p].get("pos") == m.group(1)] or cands
-            if team and len(cands) > 1:
+            team = alias.get(r[c_team].strip().upper(), r[c_team].strip().upper()) if c_team is not None and c_team < len(r) else ""
+            if len(cands) > 1 and team:
                 cands = [p for p in cands if players[p].get("team") == team] or cands
             cands = sorted(cands, key=lambda p: players[p].get("team") in (None, "", "FA"))
             if not cands:
                 continue
             pid = cands[0]
-            pos = players[pid].get("pos")
-            if pos not in ENDGAME_RANK:
-                continue
-            matched += 1
-            if m and m.group(2):
-                key = int(m.group(2))                       # explicit positional rank
-            elif c_pts is not None and c_pts < len(r):
+            if c_pts is not None and c_pts < len(r):
                 try:
-                    key = -float(r[c_pts].replace(",", ""))  # rank by points, high first
+                    pts[pid] = float(r[c_pts].replace(",", ""))
                 except ValueError:
-                    key = order
-            else:
-                key = float(r[c_rk]) if c_rk is not None and c_rk < len(r) and r[c_rk].strip() else order
-            by_pos.setdefault(pos, {})[pid] = key
-    rank = {}
-    for d in by_pos.values():
-        rank.update({pid: i + 1 for i, pid in enumerate(sorted(d, key=d.get))})
-    when = time.strftime("%m-%d", time.localtime(max(f.stat().st_mtime for f in files)))
-    return rank, f"FantasyPros ROS {when} ({matched}/{seen} matched)"
+                    pass
+            if m and m.group(2):
+                ranks[pid] = int(m.group(2))
+    return out
+
+
+def ros_table(players):
+    """Every source's ROS points and positional rank per player, plus the
+    blended rank. Cached 6h; a failed refresh keeps the previous table."""
+    if _ros_cache["table"] and time.time() - _ros_cache["ts"] < 6 * 3600:
+        return _ros_cache["table"]
+    try:
+        sl_pts, sl_label = sleeper_ros(players)
+        sources = {"sleeper": (sl_pts, {}, sl_label), **file_ros(players)}
+    except Exception as e:
+        print("ros_table:", e)
+        return _ros_cache["table"] or {"sources": [], "rows": {}, "label": ""}
+    rows = {}
+    for key, (pts, ranks, _) in sources.items():
+        by_pos = {}
+        for pid in set(pts) | set(ranks):
+            pos = players.get(pid, {}).get("pos")
+            if pos in ENDGAME_RANK:
+                by_pos.setdefault(pos, []).append(pid)
+        for pos, ids in by_pos.items():
+            # Explicit ranks win; otherwise rank by points within position.
+            order = sorted(ids, key=lambda p: (ranks.get(p, 10 ** 6), -(pts.get(p) or 0.0)))
+            for i, pid in enumerate(order):
+                rows.setdefault(pid, {})[key] = [round(pts[pid], 1) if pts.get(pid) is not None else None, ranks.get(pid, i + 1)]
+    by_pos = {}
+    for pid, r in rows.items():
+        by_pos.setdefault(players[pid]["pos"], []).append(pid)
+    for ids in by_pos.values():
+        mean = {p: sum(v[1] for v in rows[p].values()) / len(rows[p]) for p in ids}
+        for i, pid in enumerate(sorted(ids, key=lambda p: (mean[p], -(rows[p].get("sleeper") or [0, 0])[0] or 0))):
+            rows[pid]["blend"] = i + 1
+    labels = [{"key": k, "label": v[2]} for k, v in sources.items()]
+    table = {"sources": labels, "rows": rows,
+             "label": "blend of " + " + ".join(x["label"] for x in labels) if len(labels) > 1 else labels[0]["label"]}
+    _ros_cache.update(ts=time.time(), table=table)
+    return table
 
 
 def season_pos_rank(players):
-    """{pid: rest-of-season rank at position}; FantasyPros file if present,
-    else Sleeper's remaining weekly projections. Cached 6h; a failed fetch
-    keeps the previous ranks."""
-    if time.time() - _season_cache["ts"] < 6 * 3600 and _season_cache["rank"]:
-        return _season_cache["rank"]
-    try:
-        rank, source = fp_ros_rank(players)
-        if not rank:
-            rank, source = sleeper_ros_rank(players)
-    except Exception as e:
-        print("season_pos_rank:", e)
-        return _season_cache["rank"]
-    if rank:
-        _season_cache.update(ts=time.time(), rank=rank, source=source)
-    return _season_cache["rank"]
+    """{pid: blended rest-of-season rank at position} for the endgame tier."""
+    return {pid: r["blend"] for pid, r in ros_table(players)["rows"].items()}
+
+
+def ros_row(pid, players):
+    r = ros_table(players)["rows"].get(pid)
+    return {k: v for k, v in r.items()} if r else None
 
 
 def tier_of(frac, pos=None, season_rank=None):
@@ -1867,7 +1876,7 @@ def waiver_report(lid, as_rid=None):
         frac = len(wants) / max(1, len(rosters) - 1)
         cands.append({"id": pid, "name": p.get("name", pid), "pos": p.get("pos", ""), "team": p.get("team", ""),
                       "proj": round(val(pid), 2), "starts": pid in det2, "chop_pool": pid in chop_pool,
-                      "pos_rank": pos_rank.get(pid), "season_rank": srank.get(pid),
+                      "pos_rank": pos_rank.get(pid), "season_rank": srank.get(pid), "ros": ros_row(pid, players),
                       "tier": tier_of(frac, p.get("pos"), srank.get(pid)),
                       "max_delta": round(max((w["delta"] for w in wants), default=0.0), 2),
                       "max_swing": round(min((w["chop_swing"] for w in wants), default=0.0), 1),
@@ -1888,10 +1897,11 @@ def waiver_report(lid, as_rid=None):
             "slot": slot, "id": pid, "name": players.get(pid, {}).get("name", pid),
             "pos": players.get(pid, {}).get("pos", ""), "team": players.get(pid, {}).get("team", ""),
             "inj": players.get(pid, {}).get("inj"),
-            "proj": round(val(pid), 2), "set": pid in set_now,
+            "proj": round(val(pid), 2), "set": pid in set_now, "ros": ros_row(pid, players),
             "alts": [{"name": players.get(b, {}).get("name", b), "pos": players.get(b, {}).get("pos", ""),
                       "inj": players.get(b, {}).get("inj"),
-                      "proj": round(val(b), 2), "gap": round(val(b) - val(pid), 2), "set": b in set_now} for b in alts],
+                      "proj": round(val(b), 2), "gap": round(val(b) - val(pid), 2), "set": b in set_now,
+                      "ros": ros_row(b, players)} for b in alts],
         })
     not_optimal = [players.get(p, {}).get("name", p) for p in set_now if p not in optimal_ids]
 
@@ -1909,7 +1919,8 @@ def waiver_report(lid, as_rid=None):
     # Sort by what the add is worth to this roster, not by raw projection —
     # otherwise streaming QBs crowd out a real upgrade in a 1-QB league.
     cands.sort(key=lambda c: (-c["delta"], -c["proj"]))
-    report["rank_source"] = _season_cache["source"]
+    report["rank_source"] = ros_table(players)["label"]
+    report["ros_sources"] = ros_table(players)["sources"]
     report["candidates_all"] = cands            # for logging; UI shows WAIVER_TOP
     report["candidates"] = cands[:WAIVER_TOP]
     _waiver_cache[(lid, as_rid)] = (time.time(), report)
@@ -2672,14 +2683,20 @@ function waiverSection(pools){
         <td class="r num ${d.faab.budget && f.faab < d.faab.budget * 0.25 ? 'short' : 'pos'}">${d.faab.budget ? f.faab : '—'}</td>
         ${posCols.map(c => { const v = f.split[c]; const col = d.field.map(x => x.split[c] || 0); const lo = [...col].sort((a,b)=>a-b)[Math.floor(col.length/3)]; return `<td class="r num ${v != null && v <= lo ? 'short' : 'pos'}">${v == null ? '—' : v.toFixed(1)}</td>`; }).join('')}</tr>`).join('')}</table>`;
     const gapCls = g => g >= -1.5 ? 'warnc' : 'pos';
+    const srcs = d.ros_sources || [];
+    const short = k => ({sleeper: 'SL', fanduel: 'FD', fantasypros: 'FP'})[k] || k.slice(0, 2).toUpperCase();
+    // Blended ROS rank, with each source's rank beside it (points in the tooltip).
+    const rosCell = (x, pos) => !x ? '<span class="pos">—</span>'
+      : `<span title="${srcs.map(s => x[s.key] ? `${s.label}: ${pos}${x[s.key][1]}${x[s.key][0] != null ? ` · ${x[s.key][0]} pts` : ''}` : `${s.label}: not listed`).join('\n')}">${pos}${x.blend}${srcs.length > 1 ? ` <span class="pos" style="font-size:11px">${srcs.map(s => `${short(s.key)} ${x[s.key] ? x[s.key][1] : '—'}`).join(' · ')}</span>` : ''}</span>`;
+    const rosTag = (x, pos) => x ? ` <span class="pos" style="font-size:11px" title="ROS rank, blended">${pos}${x.blend}</span>` : '';
     body += `<h3>${d.as.is_me ? 'Your' : d.as.name + "'s"} optimal lineup · ✓ = currently set on Sleeper · bench alternatives with projection gap</h3>
       ${!d.lineup_set ? '<div class="short" style="font-size:12.5px;margin-bottom:6px">No lineup set on Sleeper yet.</div>' : (d.set_not_optimal.length ? `<div class="warnc" style="font-size:12.5px;margin-bottom:6px">Currently starting but not in the optimal lineup: ${d.set_not_optimal.join(', ')}</div>` : '')}
-      <table><tr><th>Slot</th><th>Starter</th><th class="r">Proj</th><th style="padding-left:18px">Bench options</th></tr>
+      <table><tr><th>Slot</th><th>Starter</th><th class="r">Proj</th><th>ROS</th><th style="padding-left:18px">Bench options · ROS rank in grey</th></tr>
       ${d.lineup.map(r => `<tr>
         <td class="pos">${r.slot.replace('SUPER_FLEX','SF')}</td>
         <td>${r.name} <span class="pos">${r.pos} ${r.team}</span>${inj(r.inj)}${r.set ? ' <span class="long">✓</span>' : (d.lineup_set ? ' <span class="short">not set</span>' : '')}</td>
-        <td class="r num">${f2(r.proj)}</td>
-        <td class="pos" style="padding-left:18px;font-size:12.5px">${r.alts.map(a => `${a.name}${inj(a.inj)} <span class="num">${a.proj.toFixed(1)}</span> <span class="num ${gapCls(a.gap)}">(${a.gap > 0 ? '+' : ''}${a.gap.toFixed(1)})</span>${a.set ? ' <span class="short">set</span>' : ''}`).join(' · ') || '—'}</td></tr>`).join('')}</table>`;
+        <td class="r num">${f2(r.proj)}</td><td class="num" style="padding-left:10px">${rosCell(r.ros, r.pos)}</td>
+        <td class="pos" style="padding-left:18px;font-size:12.5px">${r.alts.map(a => `${a.name}${inj(a.inj)}${rosTag(a.ros, a.pos)} <span class="num">${a.proj.toFixed(1)}</span> <span class="num ${gapCls(a.gap)}">(${a.gap > 0 ? '+' : ''}${a.gap.toFixed(1)})</span>${a.set ? ' <span class="short">set</span>' : ''}`).join(' · ') || '—'}</td></tr>`).join('')}</table>`;
     body += `<h3>Holes · ${d.as.is_me ? 'your' : 'their'} starter in each slot vs the field's</h3>
       <table><tr><th>Slot</th><th>Starter</th><th class="r">Proj</th><th class="r">Rank</th><th class="r">Median</th><th class="r">Best</th><th class="r">vs median</th></tr>
       ${d.holes.map(h => `<tr class="${h.rank > d.field_size * 0.67 ? 'hole' : ''}"><td class="pos">${h.pos}</td><td>${h.who}</td><td class="r num">${f2(h.mine)}</td>
@@ -2693,10 +2710,10 @@ function waiverSection(pools){
     const posBar = allPos.map(p => `<label class="lg-item"><input type="checkbox" ${shownPos.has(p) ? 'checked' : ''} onclick="event.stopPropagation();(waivPos['${waivLeague}'].has('${p}') ? waivPos['${waivLeague}'].delete('${p}') : waivPos['${waivLeague}'].add('${p}'));tick()"> ${p}</label>`).join(' ');
     const cands = d.candidates_all.filter(c => shownPos.has(c.pos)).slice(0, 12);
     body += `<h3>Top free agents · best Δ to your lineup, whole wire screened · endgame by ${d.rank_source || 'ROS rank'}${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''} &nbsp; <span style="font-weight:400">${posBar}</span></h3>
-      <table><tr><th>Player</th><th class="r">Proj</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
+      <table><tr><th>Player</th><th class="r">Proj</th><th title="rest-of-season positional rank: blend, then each source">ROS</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
       ${cands.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
         <td>${c.name} <span class="pos">${c.pos} ${c.team}</span>${c.tier === 1 ? ` <span class="long" style="font-size:11px">endgame ${c.pos}${c.season_rank}</span>` : (c.tier === 2 ? ` <span class="pos" style="font-size:11px">starter</span>` : '')}${c.chop_pool ? ` <span class="short" style="font-size:11px">chop pool</span>` : ''}</td>
-        <td class="r num">${f2(c.proj)}</td><td class="r num">${f2(c.proj_after)}</td>
+        <td class="r num">${f2(c.proj)}</td><td class="num" style="padding-left:10px">${rosCell(c.ros, c.pos)}</td><td class="r num">${f2(c.proj_after)}</td>
         <td class="r num ${sgn(c.delta)}">${c.delta > 0 ? '+' : ''}${f2(c.delta)}</td>
         <td class="r num ${c.chop_after < d.base.chop_pct ? 'long' : 'pos'}">${c.chop_after}%<span class="pos" style="font-size:11px"> (${(c.chop_after - d.base.chop_pct) > 0 ? '+' : ''}${(c.chop_after - d.base.chop_pct).toFixed(1)})</span></td>
         <td class="pos" style="font-size:12.5px">${c.starts ? (c.displaces.join(', ') || '—') : 'bench'}</td>
