@@ -10,6 +10,7 @@ ESPN leagues go in espn.json (see espn.example.json; needs espn_s2 + SWID).
 """
 
 import base64
+import datetime
 import hashlib
 import zlib
 import hmac
@@ -107,6 +108,15 @@ def get(path, base=BASE, tries=3):
 
 
 INJ_OUT = {"Out", "IR", "PUP", "Sus", "COV", "DNR"}   # zero the projection
+INJ_LONG = INJ_OUT - {"Out"}      # multi-week statuses: zero whatever the day
+# Game-status designations (Out/Doubtful/Questionable) come with the final
+# injury report, 1-2 days before kickoff. Earlier in the week Sleeper still
+# shows LAST week's "Out" (Jefferson, Coker on a Tuesday) while its own
+# projection already says whether he's expected back — it zeroes the ones it
+# expects to miss (Breece Hall, Daniels). So "Out" only zeroes a projection
+# inside this window before the player's kickoff.
+FINAL_REPORT_HOURS = 56
+_stale_out = set()                # "Out" tags ignored as last week's; shown as "Out?"
 
 
 def load_players():
@@ -138,18 +148,63 @@ def load_projections(season, week, players=None):
     league-specific projection is just sum(stat * weight). Re-fetched every
     15 min since Sleeper revises them as inactives come in.
     """
-    key = (season, week)
+    key = (season, week, players is not None)      # raw (players=None) and zeroed differ
     if _proj_cache["key"] == key and time.time() - _proj_cache["ts"] < 900:
         return _proj_cache["data"]
     qs = "&".join(f"position[]={p}" for p in ("QB", "RB", "WR", "TE", "K", "DEF"))
     rows = get(f"/{season}/{week}?season_type=regular&{qs}", base=PROJ_BASE)
     data = {row["player_id"]: row.get("stats") or {} for row in rows}
-    # Sleeper keeps projecting players who've been ruled out; don't.
-    for pid in list(data):
-        if (players or {}).get(pid, {}).get("inj") in INJ_OUT:
-            data[pid] = {}
+    # Sleeper keeps projecting players who've been ruled out; don't. But an
+    # "Out" from before this week's final report is last week's (see
+    # FINAL_REPORT_HOURS): keep Sleeper's number and flag it instead.
+    if players:
+        kick = kickoffs(season, week)
+        stale = set()
+        for pid in list(data):
+            inj = players.get(pid, {}).get("inj")
+            if inj in INJ_LONG:
+                data[pid] = {}
+            elif inj == "Out":
+                t = kick.get(players[pid].get("team"))
+                if t is not None and time.time() < t - FINAL_REPORT_HOURS * 3600:
+                    if (data[pid].get("pts_ppr") or 0) > 0:      # Sleeper expects him back
+                        stale.add(pid)
+                else:
+                    data[pid] = {}
+        _stale_out.clear()
+        _stale_out.update(stale)
     _proj_cache.update(key=key, ts=time.time(), data=data)
     return data
+
+
+_kick_cache = {}
+
+
+def kickoffs(season, week):
+    """{team: kickoff epoch} for the week, from ESPN's scoreboard. Cached 1h;
+    {} on failure (then "Out" zeroes as before)."""
+    hit = _kick_cache.get((season, week))
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    out = {}
+    try:
+        sb = requests.get(f"{ESPN_SITE}/scoreboard?dates={season}&seasontype=2&week={week}",
+                          headers=ESPN_UA, timeout=10).json()
+        for ev in sb.get("events", []):
+            t = datetime.datetime.fromisoformat(ev["date"].replace("Z", "+00:00")).timestamp()
+            for c in ev["competitions"][0]["competitors"]:
+                ab = c["team"]["abbreviation"]
+                out[ESPN_TEAM_FIX.get(ab, ab)] = t
+    except Exception as e:
+        print("kickoffs:", e)
+    _kick_cache[(season, week)] = (time.time(), out)
+    return out
+
+
+def inj_label(pid, players):
+    """Injury tag for display: "Out?" when it's last week's Out being ignored."""
+    inj = players.get(pid, {}).get("inj")
+    return "Out?" if inj == "Out" and pid in _stale_out else inj
 
 
 def load_stats(season, week):
@@ -305,7 +360,7 @@ def lineup_rows(det, players, stats):
         p = players.get(pid, {})
         rows.append({
             "pid": pid, "name": p.get("name", pid), "pos": p.get("pos", ""), "team": p.get("team", ""),
-            "inj": p.get("inj"),
+            "inj": inj_label(pid, players),
             "act": round(d["act"], 2), "proj": round(d["proj"], 2),
             "final": round(d["act"] + d["proj"] * d["rem"], 2), "rem": round(d["rem"], 3),
             "ot": (pid if pid in OT_TEAMS else p.get("team")) in OT_TEAMS,
@@ -1896,10 +1951,10 @@ def waiver_report(lid, as_rid=None):
         lineup_rows_out.append({
             "slot": slot, "id": pid, "name": players.get(pid, {}).get("name", pid),
             "pos": players.get(pid, {}).get("pos", ""), "team": players.get(pid, {}).get("team", ""),
-            "inj": players.get(pid, {}).get("inj"),
+            "inj": inj_label(pid, players),
             "proj": round(val(pid), 2), "set": pid in set_now, "ros": ros_row(pid, players),
             "alts": [{"name": players.get(b, {}).get("name", b), "pos": players.get(b, {}).get("pos", ""),
-                      "inj": players.get(b, {}).get("inj"),
+                      "inj": inj_label(b, players),
                       "proj": round(val(b), 2), "gap": round(val(b) - val(pid), 2), "set": b in set_now,
                       "ros": ros_row(b, players)} for b in alts],
         })
