@@ -2,7 +2,7 @@
 espn.json
 # local runtime state
 .venv/
-blotter.sqlite
+blotter.sqlite*
 players_nfl.json
 __pycache__/
 *.pyc
