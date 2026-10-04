@@ -3,18 +3,21 @@
     "name": "Eliminator.gg",
     "scoring": "eliminator",
     "starters": [
-      "Brock Purdy",
-      "Quinshon Judkins",
-      "De'Von Achane",
-      "Garrett Wilson",
-      "KC Concepcion",
-      "Devaughn Vele",
-      "George Kittle",
+      "Trevor Lawrence",
+      "Emanuel Wilson",
+      "Jeremiyah Love",
+      "Jordan Addison",
+      "Dontayvion Wicks",
+      "Amon-Ra St. Brown",
       {
-        "name": "Jahmyr Gibbs",
+        "name": "Kenyon Sadiq",
+        "mult": 1.5
+      },
+      {
+        "name": "Bijan Robinson",
         "mult": 1.5
       }
     ],
-    "week": 3
+    "week": 4
   }
 ]
