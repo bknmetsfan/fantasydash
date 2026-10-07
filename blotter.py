@@ -178,6 +178,19 @@ def load_projections(season, week, players=None):
 
 
 _kick_cache = {}
+_week_proj_cache = {}
+
+
+def week_projections(season, week):
+    """Raw Sleeper projections for a future week (byes come back as no row,
+    i.e. 0). Cached 1h; separate from load_projections' single slot."""
+    hit = _week_proj_cache.get((season, week))
+    if hit and time.time() - hit[0] < 3600:
+        return hit[1]
+    qs = "&".join(f"position[]={p}" for p in ("QB", "RB", "WR", "TE", "K", "DEF"))
+    data = {r["player_id"]: r.get("stats") or {} for r in get(f"/{season}/{week}?season_type=regular&{qs}", base=PROJ_BASE)}
+    _week_proj_cache[(season, week)] = (time.time(), data)
+    return data
 
 
 def kickoffs(season, week):
@@ -1906,6 +1919,20 @@ def waiver_report(lid, as_rid=None):
         mat = np.array([team_sims if r == rid else sims[r] for r in rids])
         return 100 * float(np.mean(mat.argmin(axis=0) == rids.index(rid)))
 
+    # Bye-aware look ahead: this week plus the next two, each scored with
+    # that week's projections (a team on bye projects 0 that week).
+    ahead = [(week, val)] + [(w, (lambda pw: (lambda p: proj_pts(p, pw, scoring) or 0.0))(week_projections(CONFIG["season"], w)))
+                             for w in range(week + 1, min(week + 3, LAST_WEEK + 1))]
+    lineup_total = lambda ids, v: sum(v(p) for p in best_lineup(ids, slots, v, players))
+    my_ahead = [lineup_total(mine["players"], v) for _, v in ahead]
+    outlook = []
+    starters_now = best_lineup(mine["players"], slots, val, players)
+    for (w, v), mine_w in zip(ahead, my_ahead):
+        field_w = sorted((lineup_total(r["players"], v) for r in rosters), reverse=True)
+        outlook.append({"week": w, "mine": round(mine_w, 1), "rank": field_w.index(mine_w) + 1 if mine_w in field_w else None,
+                        "of": len(field_w), "median": round(float(np.median(field_w)), 1),
+                        "byes": [players.get(p, {}).get("name", p) for p in starters_now if v(p) == 0 and val(p) > 0]
+                                if w != week else []})
     cands = []
     for pid in fas:
         det2 = det_for(list(mine["players"]) + [pid])
@@ -1936,6 +1963,7 @@ def waiver_report(lid, as_rid=None):
                       "max_delta": round(max((w["delta"] for w in wants), default=0.0), 2),
                       "max_swing": round(min((w["chop_swing"] for w in wants), default=0.0), 1),
                       "proj_after": proj2, "delta": round(proj2 - base["proj"], 2),
+                      "delta_weeks": [round(lineup_total(list(mine["players"]) + [pid], v) - m, 1) for (_, v), m in zip(ahead, my_ahead)],
                       "chop_after": chop_pct(s2), "displaces": displaced,
                       "demand": {"starts": len(wants), "of": len(rosters) - 1, "top": wants[:3]}})
     # My lineup by slot, what's actually set on Sleeper, and the best bench
@@ -1970,6 +1998,7 @@ def waiver_report(lid, as_rid=None):
         "field_size": len(rosters), "base": base, "holes": holes, "candidates": cands, "chop_name": chop_name,
         "slot_order": slot_order,
         "lineup": lineup_rows_out, "set_not_optimal": not_optimal, "lineup_set": bool(set_now),
+        "outlook": outlook,
     }
     # Sort by what the add is worth to this roster, not by raw projection —
     # otherwise streaming QBs crowd out a real upgrade in a 1-QB league.
@@ -2739,6 +2768,7 @@ function waiverSection(pools){
         ${posCols.map(c => { const v = f.split[c]; const col = d.field.map(x => x.split[c] || 0); const lo = [...col].sort((a,b)=>a-b)[Math.floor(col.length/3)]; return `<td class="r num ${v != null && v <= lo ? 'short' : 'pos'}">${v == null ? '—' : v.toFixed(1)}</td>`; }).join('')}</tr>`).join('')}</table>`;
     const gapCls = g => g >= -1.5 ? 'warnc' : 'pos';
     const srcs = d.ros_sources || [];
+    const dsum = c => (c.delta_weeks || []).reduce((a, x) => a + x, 0);
     const short = k => ({sleeper: 'SL', fanduel: 'FD', fantasypros: 'FP'})[k] || k.slice(0, 2).toUpperCase();
     // Blended ROS rank, with each source's rank beside it (points in the tooltip).
     const rosCell = (x, pos) => !x ? '<span class="pos">—</span>'
@@ -2752,6 +2782,7 @@ function waiverSection(pools){
         <td>${r.name} <span class="pos">${r.pos} ${r.team}</span>${inj(r.inj)}${r.set ? ' <span class="long">✓</span>' : (d.lineup_set ? ' <span class="short">not set</span>' : '')}</td>
         <td class="r num">${f2(r.proj)}</td><td class="num" style="padding-left:10px">${rosCell(r.ros, r.pos)}</td>
         <td class="pos" style="padding-left:18px;font-size:12.5px">${r.alts.map(a => `${a.name}${inj(a.inj)}${rosTag(a.ros, a.pos)} <span class="num">${a.proj.toFixed(1)}</span> <span class="num ${gapCls(a.gap)}">(${a.gap > 0 ? '+' : ''}${a.gap.toFixed(1)})</span>${a.set ? ' <span class="short">set</span>' : ''}`).join(' · ') || '—'}</td></tr>`).join('')}</table>`;
+    if (d.outlook && d.outlook.length) body += `<div class="pos" style="font-size:12.5px;margin:2px 0 8px">Next weeks (byes count as 0): ${d.outlook.map(o => `<b>wk${o.week}</b> ${o.mine.toFixed(1)} <span class="${o.rank > o.of * 0.67 ? 'short' : ''}">#${o.rank}/${o.of}</span> (median ${o.median.toFixed(1)})${o.byes.length ? ` <span class="warnc">bye: ${o.byes.join(', ')}</span>` : ''}`).join(' · ')}</div>`;
     body += `<h3>Holes · ${d.as.is_me ? 'your' : 'their'} starter in each slot vs the field's</h3>
       <table><tr><th>Slot</th><th>Starter</th><th class="r">Proj</th><th class="r">Rank</th><th class="r">Median</th><th class="r">Best</th><th class="r">vs median</th></tr>
       ${d.holes.map(h => `<tr class="${h.rank > d.field_size * 0.67 ? 'hole' : ''}"><td class="pos">${h.pos}</td><td>${h.who}</td><td class="r num">${f2(h.mine)}</td>
@@ -2765,11 +2796,12 @@ function waiverSection(pools){
     const posBar = allPos.map(p => `<label class="lg-item"><input type="checkbox" ${shownPos.has(p) ? 'checked' : ''} onclick="event.stopPropagation();(waivPos['${waivLeague}'].has('${p}') ? waivPos['${waivLeague}'].delete('${p}') : waivPos['${waivLeague}'].add('${p}'));tick()"> ${p}</label>`).join(' ');
     const cands = d.candidates_all.filter(c => shownPos.has(c.pos)).slice(0, 12);
     body += `<h3>Top free agents · best Δ to your lineup, whole wire screened · endgame by ${d.rank_source || 'ROS rank'}${d.chop_name ? ` · <span class="short">chop pool</span> = still on ${d.chop_name}'s roster until dropped` : ''} &nbsp; <span style="font-weight:400">${posBar}</span></h3>
-      <table><tr><th>Player</th><th class="r">Proj</th><th title="rest-of-season positional rank: blend, then each source">ROS</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
+      <table><tr><th>Player</th><th class="r">Proj</th><th title="rest-of-season positional rank: blend, then each source">ROS</th><th class="r">You after</th><th class="r">Δ proj</th><th class="r" title="gain to your lineup over this week and the next two, each with that week's projections — byes count as 0">Δ 3 wk</th><th class="r">Chop after</th><th>Displaces</th><th style="padding-left:14px">Demand · who else starts him</th></tr>
       ${cands.map(c => `<tr class="${c.delta <= 0 ? 'done' : ''}">
         <td>${c.name} <span class="pos">${c.pos} ${c.team}</span>${c.tier === 1 ? ` <span class="long" style="font-size:11px">endgame ${c.pos}${c.season_rank}</span>` : (c.tier === 2 ? ` <span class="pos" style="font-size:11px">starter</span>` : '')}${c.chop_pool ? ` <span class="short" style="font-size:11px">chop pool</span>` : ''}</td>
         <td class="r num">${f2(c.proj)}</td><td class="num" style="padding-left:10px">${rosCell(c.ros, c.pos)}</td><td class="r num">${f2(c.proj_after)}</td>
         <td class="r num ${sgn(c.delta)}">${c.delta > 0 ? '+' : ''}${f2(c.delta)}</td>
+        <td class="r num ${sgn(dsum(c))}" title="${(c.delta_weeks || []).map((x, i) => `wk${d.outlook[i].week}: ${x > 0 ? '+' : ''}${x.toFixed(1)}`).join('\n')}">${dsum(c) > 0 ? '+' : ''}${dsum(c).toFixed(1)}</td>
         <td class="r num ${c.chop_after < d.base.chop_pct ? 'long' : 'pos'}">${c.chop_after}%<span class="pos" style="font-size:11px"> (${(c.chop_after - d.base.chop_pct) > 0 ? '+' : ''}${(c.chop_after - d.base.chop_pct).toFixed(1)})</span></td>
         <td class="pos" style="font-size:12.5px">${c.starts ? (c.displaces.join(', ') || '—') : 'bench'}</td>
         <td class="pos" style="font-size:12.5px;padding-left:14px"><b class="${c.demand.starts >= c.demand.of / 2 ? 'short' : ''}">${c.demand.starts}/${c.demand.of}</b>${c.demand.top.length ? ' · ' + c.demand.top.map(w => `${w.name} <span class="num">${w.chop_swing.toFixed(1)}%</span>`).join(', ') : ''}</td></tr>`).join('')}</table>`;

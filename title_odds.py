@@ -61,8 +61,10 @@ def league_inputs(lid):
                        "faab": budget - ((r.get("settings") or {}).get("waiver_budget_used") or 0)} for r in rosters]}
 
 
-def simulate_season(L, sims=400, seed=1, auction=True):
-    """auction=False: frozen rosters, the no-waivers baseline."""
+def simulate_season(L, sims=400, seed=1, auction=True, pending_waivers=False, shut_out=()):
+    """auction=False: frozen rosters, the no-waivers baseline.
+    pending_waivers: run this week's (not yet processed) waiver auction
+    before the first week is played; teams in shut_out win nothing in it."""
     rng = np.random.default_rng(seed)
     players, slots, pts, weeks = L["players"], L["slots"], L["pts"], L["weeks"]
     cv = {p: b.CV.get(players.get(p, {}).get("pos"), 0.7) for p in pts}
@@ -73,11 +75,37 @@ def simulate_season(L, sims=400, seed=1, auction=True):
     exit_week = {r: [] for r in rids}
     alive_after = {r: np.zeros(len(weeks) + 1) for r in rids}
     spent = dict.fromkeys(rids, 0.0)
+    def run_auction(ros, faab, pool, alive, hz, exclude=()):
+        hv = {p: float(pts[p][hz].mean()) for p in pool | set().union(*(ros[r] for r in alive))}
+        total = lambda r, extra=None: sum(hv[p] for p in lineup(ros[r] | ({extra} if extra else set()), hv))
+        base = {r: total(r) for r in alive}
+        urgency = 1 + 2 * (1 - len(alive) / n0)
+        for p in sorted(pool, key=lambda p: -hv[p])[:AUCTION_PER_WEEK]:
+            bids = []
+            for r in alive:
+                if r in exclude:
+                    continue
+                gain = total(r, p) - base[r]
+                if gain < 0.5:
+                    continue
+                share = min(0.8, (gain / 20) ** 1.5) * urgency * rng.lognormal(0, 0.3)
+                bids.append((min(faab[r], round(faab[r] * min(share, 1.0))), rng.random(), r))
+            if not bids:
+                continue
+            bid, _, win = max(bids)
+            faab[win] -= bid
+            spent[win] += bid
+            ros[win].add(p)
+            pool.discard(p)
+            base[win] = total(win)
+
     for _ in range(sims):
         ros = {t["rid"]: set(t["players"]) for t in L["teams"]}
         faab = {t["rid"]: float(t["faab"]) for t in L["teams"]}
         pool = set(L["pool"])
         alive = list(rids)
+        if pending_waivers and auction:
+            run_auction(ros, faab, pool, alive, slice(0, HORIZON), exclude=set(shut_out))
         for wi, w in enumerate(weeks):
             if len(alive) == 1:
                 break
@@ -98,27 +126,8 @@ def simulate_season(L, sims=400, seed=1, auction=True):
             if len(alive) == 1:
                 break
             # Waivers for next week: bid on the gain over the next HORIZON weeks.
-            hz = slice(wi + 1, min(wi + 1 + HORIZON, len(weeks)))
-            hv = {p: float(pts[p][hz].mean()) for p in pool | set().union(*(ros[r] for r in alive))}
-            total = lambda r, extra=None: sum(hv[p] for p in lineup(ros[r] | ({extra} if extra else set()), hv))
-            base = {r: total(r) for r in alive}
-            urgency = 1 + 2 * (1 - len(alive) / n0)
-            for p in sorted(pool, key=lambda p: -hv[p])[:AUCTION_PER_WEEK if auction else 0]:
-                bids = []
-                for r in alive:
-                    gain = total(r, p) - base[r]
-                    if gain < 0.5:
-                        continue
-                    share = min(0.8, (gain / 20) ** 1.5) * urgency * rng.lognormal(0, 0.3)
-                    bids.append((min(faab[r], round(faab[r] * min(share, 1.0))), rng.random(), r))
-                if not bids:
-                    continue
-                bid, _, win = max(bids)
-                faab[win] -= bid
-                spent[win] += bid
-                ros[win].add(p)
-                pool.discard(p)
-                base[win] = total(win)
+            if auction:
+                run_auction(ros, faab, pool, alive, slice(wi + 1, min(wi + 1 + HORIZON, len(weeks))))
         title[alive[0]] += 1
     out = []
     for t in L["teams"]:
