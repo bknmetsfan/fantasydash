@@ -1310,8 +1310,12 @@ def build():
 
         proj_by_rid = {m["roster_id"]: lineup(m) for m in matchups}
         sims = simulate({rid: det for rid, (_, _, det) in proj_by_rid.items()}, CONFIG["sims"])
+        budget = (lg.get("settings") or {}).get("waiver_budget") or 0
+        faab_left = {r["roster_id"]: budget - ((r.get("settings") or {}).get("waiver_budget_used") or 0)
+                     for r in rosters} if budget else {}
         field = sorted(
             [{"rid": m["roster_id"], "name": team_name(m["roster_id"]),
+              "faab": faab_left.get(m["roster_id"]),
               "pts": round(m.get("points") or 0.0, 2),
               "proj": round(sum(proj_by_rid[m["roster_id"]][1].values()), 2),
               "to_play": to_play(proj_by_rid[m["roster_id"]][2])}
@@ -2819,17 +2823,18 @@ function poolDetail(l){
   const proj = [...l.field].sort((a,b) => b.proj - a.proj);
   return `<div class="detail">
     <h3>Field · by proj final (chop line above the last row) · live rank in grey</h3>
-    <table><tr><th class="rk">#</th><th>Team</th><th class="r">Chop %</th>${l.prize ? '<th class="r" title="share of sims with the week\'s high score">Top %</th>' : ''}<th class="r">Proj final</th><th class="r">Pts</th><th class="r">To play</th><th class="r">Live #</th></tr>
+    <table><tr><th class="rk">#</th><th>Team</th><th class="r">Chop %</th>${l.prize ? '<th class="r" title="share of sims with the week\'s high score">Top %</th>' : ''}<th class="r" title="FAAB left — a high budget on the chop line leaves the league with them">FAAB</th><th class="r">Proj final</th><th class="r">Pts</th><th class="r">To play</th><th class="r">Live #</th></tr>
     ${proj.map((t,i) => {
       const key = `team:${l.league_id}:${t.rid}`, isOpen = open.has(key);
       return `<tr class="${t.rid === me ? 'me' : ''} ${i === n - 2 ? 'line' : ''} trow" onclick="event.stopPropagation();toggle('${key}')">
       <td class="rk num">${i+1}</td><td><span class="caret">${isOpen ? '▾' : '▸'}</span> ${t.name}</td>
       <td class="r num ${t.chop_pct >= 15 ? 'short' : ''}">${Math.round(t.chop_pct)}</td>
       ${l.prize ? `<td class="r num ${t.top_pct >= 15 ? 'long' : 'pos'}">${t.top_pct == null ? '—' : Math.round(t.top_pct)}</td>` : ''}
+      <td class="r num pos">${t.faab == null ? '—' : t.faab}</td>
       <td class="r num">${f2(t.proj)}</td><td class="r num">${f2(t.pts)}</td>
       <td class="r num pos">${t.to_play[0]}${t.to_play[1] ? `<span style="color:var(--warn)"> ·${t.to_play[1]}</span>` : ''}</td>
       <td class="r num pos">${lrank[t.rid]}</td></tr>
-      ${isOpen && t.lineup ? `<tr class="tdetail"><td colspan="${l.prize ? 8 : 7}">${lineupTable(t.name, t.lineup)}</td></tr>` : ''}`;
+      ${isOpen && t.lineup ? `<tr class="tdetail"><td colspan="${l.prize ? 9 : 8}">${lineupTable(t.name, t.lineup)}</td></tr>` : ''}`;
     }).join('')}
     </table>
     ${l.prize ? prizeBlock(l) : ''}
