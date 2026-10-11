@@ -3,21 +3,18 @@
     "name": "Eliminator.gg",
     "scoring": "eliminator",
     "starters": [
-      "Trevor Lawrence",
-      "Emanuel Wilson",
-      "Jeremiyah Love",
-      "Jordan Addison",
-      "Dontayvion Wicks",
-      "Amon-Ra St. Brown",
-      {
-        "name": "Kenyon Sadiq",
-        "mult": 1.5
-      },
+      "Malik Willis",
+      "Braelon Allen",
+      "RJ Harvey",
+      "Malik Washington",
+      "Ja'Marr Chase",
+      "Michael Wilson",
+      "Isaiah Likely",
       {
         "name": "Bijan Robinson",
         "mult": 1.5
       }
     ],
-    "week": 4
+    "week": 5
   }
 ]
