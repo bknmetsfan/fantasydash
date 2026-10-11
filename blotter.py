@@ -636,7 +636,7 @@ def build_feed(book, players=None, scoring_by_tag=None):
             def deltas(h):
                 d, mults = {}, {}
                 for tag in list(h["for"]) + list(h["against"]):
-                    sc = (scoring_by_tag or {}).get(tag.replace(" (bench)", ""))
+                    sc = (scoring_by_tag or {}).get(re.sub(r" \((bench|sat)\)$", "", tag))
                     if sc is not None:
                         base = price(stats_by_pid.get(h["id"], {}), sc["scoring"], sc.get("key"))
                         m = (sc.get("mults") or {}).get(h["id"], 1)
@@ -1537,6 +1537,21 @@ def build():
                 pl = players.get(b["id"], {})
                 watch[b["id"]] = {"id": b["id"], "name": pl.get("name", b["id"]), "team": pl.get("team", ""),
                                   "pts": b["pts"], "for": [tag], "against": []}
+    # Everyone else on my rosters (non-best-ball benches): tagged "(sat)" so
+    # the page can show or hide them; they carry no rooting interest.
+    for lg in out_leagues:
+        if lg.get("best_ball") or lg["mode"] == "error":
+            continue
+        for r in lg.get("bench_lineup") or []:
+            tag = f"{lg['name'][:14]} (sat)"
+            pid = r.get("pid") or r.get("id")
+            if not pid:
+                continue
+            if pid in watch:
+                watch[pid] = {**watch[pid], "for": watch[pid]["for"] + [tag]}
+            else:
+                watch[pid] = {"id": pid, "name": r.get("name", pid), "team": r.get("team", ""),
+                              "pts": r.get("act"), "for": [tag], "against": []}
     scoring_by_tag = {lg["name"][:14]: {"scoring": lg.get("scoring"), "key": lg.get("scoring_key"),
                                         "mults": lg.get("mults") or {}}
                       for lg in out_leagues if lg["mode"] != "error"}
@@ -2972,6 +2987,21 @@ function feedRows(feed){
   return head + rows + more;
 }
 
+// Benched (non-best-ball) players ride along in the feed tagged "(sat)";
+// hidden unless the toggle is on.
+let feedSat = (() => { try { return localStorage.getItem('feedSat') === '1'; } catch(e){ return false; } })();
+function setFeedSat(on){ feedSat = on; try { localStorage.setItem('feedSat', on ? '1' : '0'); } catch(e){} tick(); }
+function feedFilter(feed){
+  if (feedSat) return feed || [];
+  return (feed || []).map(e => ({...e, players: e.players
+      .map(p => ({...p, for: p.for.filter(t => !t.endsWith('(sat)'))}))
+      .filter(p => p.for.length || p.against.length)}))
+    .filter(e => e.players.length);
+}
+function satToggle(){
+  return `<label class="pos" style="font-size:12px;display:inline-block;margin:0 0 6px" onclick="event.stopPropagation()"><input type="checkbox" ${feedSat ? 'checked' : ''} onchange="setFeedSat(this.checked)"> include benched players</label>`;
+}
+
 function bookRows(book){
   const sgn = x => x > 0 ? 'long' : (x < 0 ? 'short' : 'pos');
   return book.map(p => {
@@ -3042,7 +3072,8 @@ async function tick(){
   if (pools.length) html += section('pools', 'Guillotine', pools.map(chopCard).join(''));
   if (h2h.length) html += section('h2h', 'Head to head', h2h.map(h2hRow).join(''));
   if (manual.length) html += section('solo', 'Solo', manual.map(manualRow).join(''));
-  html += section('feed', 'Feed', feedRows(d.feed), (d.feed || []).length, !(d.feed || []).length);
+  const fd = feedFilter(d.feed);
+  html += section('feed', 'Feed', satToggle() + feedRows(fd), fd.length, !fd.length);
   const bookHtml = `<table>
     <tr><th>Player</th><th class="r">Pts</th><th class="r">Proj final</th><th class="r" title="root x remaining projection: swing still on the table">Impact</th><th class="r" title="pp of survival/win per fantasy point, summed over leagues">Root /pt</th><th>Leagues</th></tr>
     ${bookRows(d.book)}</table>`;
