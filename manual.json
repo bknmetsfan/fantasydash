@@ -9,7 +9,11 @@
       "Drake London",
       "Germie Bernard",
       "Xavier Worthy",
-      "George Kittle"
+      "George Kittle",
+      {
+        "name": "Brock Bowers",
+        "mult": 1.5
+      }
     ],
     "week": 6
   }
