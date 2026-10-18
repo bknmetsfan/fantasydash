@@ -3,18 +3,14 @@
     "name": "Eliminator.gg",
     "scoring": "eliminator",
     "starters": [
-      "Malik Willis",
-      "Braelon Allen",
-      "RJ Harvey",
-      "Malik Washington",
-      "Ja'Marr Chase",
-      "Michael Wilson",
-      "Isaiah Likely",
-      {
-        "name": "Bijan Robinson",
-        "mult": 1.5
-      }
+      "Kirk Cousins",
+      "D'Andre Swift",
+      "Kenneth Walker",
+      "Drake London",
+      "Germie Bernard",
+      "Xavier Worthy",
+      "George Kittle"
     ],
-    "week": 5
+    "week": 6
   }
 ]
