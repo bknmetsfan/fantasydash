@@ -2626,6 +2626,8 @@ PAGE = r"""<!doctype html>
   .chartsec tr.line td{border-bottom:2px solid var(--short)}
   tr.hole td{background:rgba(166,64,43,.07)}
   .chartwrap{margin:4px 0 14px}
+  .cplot{position:relative}
+  .ctip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--rule);padding:6px 9px;font-size:12px;line-height:1.5;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.12);z-index:3}
   .chartbar{font-size:12.5px;margin-bottom:6px}
   .chartbar a{color:var(--mute);text-decoration:none}
   .chartbar select{font:inherit;font-size:12.5px;padding:2px 4px;border:1px solid var(--rule);background:var(--panel);color:var(--ink)}
@@ -2716,6 +2718,8 @@ function chartToggleTeam(lid, rid){
   const sel = chartSel[lid]; sel.has(rid) ? sel.delete(rid) : sel.add(rid); tick();
 }
 
+const chartState = {};      // league_id -> what the hover tooltip needs
+function niceStep(span){ const p = Math.pow(10, Math.floor(Math.log10(span / 4))), m = span / 4 / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
 function historyChart(l, d){
   if (!d || !d.teams.length) return '<div class="pos">No history logged for this week yet.</div>';
   if (!chartSel[l.league_id]){
@@ -2727,43 +2731,73 @@ function historyChart(l, d){
   const sel = chartSel[l.league_id];
   const mode = chartMode === 'chop' && !d.has_chop ? 'proj' : chartMode;
   const idx = {proj: 2, pts: 1, chop: 3}[mode];
+  const fmt = v => mode === 'chop' ? `${Math.round(v)}%` : v.toFixed(1);
   const shown = d.teams.filter(t => sel.has(t.rid));
-  const W = 820, H = 300, L = 44, R = 46, T = 10, B = 28;
-  const all = shown.flatMap(t => t.series);
-  // Even spacing per snapshot ("game time"): dead time is already dropped
-  // server-side, and real-time jumps > 30 min get a dotted marker.
+  const W = 820, H = 300, L = 48, R = 56, T = 12, B = 30;
+  // Even spacing per snapshot ("game time"): dead time is dropped server-side.
   const times = [...new Set(d.teams.flatMap(t => t.series.map(p => p[0])))].sort((a, b) => a - b);
   const xi = new Map(times.map((t, i) => [t, i]));
-  const x0 = 0, x1 = Math.max(1, times.length - 1);
-  const ys = all.map(p => p[idx]).filter(v => v != null);
-  let y0 = Math.min(...ys, mode !== 'proj' ? 0 : Infinity), y1 = Math.max(...ys);
-  if (!isFinite(y0) || !isFinite(y1)) return '<div class="pos">Pick a team to plot.</div>';
-  if (y1 - y0 < 10) y1 = y0 + 10;
-  const pad = (y1 - y0) * 0.05; y0 -= pad; y1 += pad;
-  const X = t => L + ((xi.get(t) ?? 0) - x0) / Math.max(1, x1 - x0) * (W - L - R);
+  const x1 = Math.max(1, times.length - 1);
+  const ys = shown.flatMap(t => t.series.map(p => p[idx])).filter(v => v != null);
+  if (!ys.length) return chartFrame(l, d, '<div class="pos" style="padding:20px 0">Pick a team to plot.</div>');
+  // Y axis: 0-100 for chop %; otherwise round numbers that contain the data.
+  let y0, y1, step;
+  if (mode === 'chop'){ y0 = 0; y1 = 100; step = 25; }
+  else {
+    y0 = Math.min(...ys, mode === 'pts' ? 0 : Infinity); y1 = Math.max(...ys);
+    if (y1 - y0 < 10) y1 = y0 + 10;
+    step = niceStep(y1 - y0); y0 = Math.floor(y0 / step) * step; y1 = Math.ceil(y1 / step) * step;
+  }
+  const X = t => L + (xi.get(t) ?? 0) / x1 * (W - L - R);
   const Y = v => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
   const hh = t => { const dt = new Date(t * 1000); return dt.getHours() + ':' + String(dt.getMinutes()).padStart(2, '0'); };
-  // axes: 5 y ticks; ~8 time labels; dotted markers where real time jumps
+  const day = t => new Date(t * 1000).toLocaleDateString(undefined, {weekday: 'short'});
   let g = '';
-  for (let i = 0; i <= 4; i++){ const v = y0 + (y1 - y0) * i / 4; g += `<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--rule)"/><text x="${L-6}" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--mute)">${v.toFixed(0)}</text>`; }
-  const every = Math.max(1, Math.round(times.length / 8));
-  const dayOf = t => new Date(t * 1000).toLocaleDateString(undefined, {weekday: 'short'});
+  for (let v = y0; v <= y1 + 1e-9; v += step)
+    g += `<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--rule)"/><text x="${L-8}" y="${Y(v)+4}" text-anchor="end" font-size="12" fill="var(--mute)">${mode === 'chop' ? v + '%' : (+v.toFixed(1))}</text>`;
+  // X axis: ~7 labels, with the weekday whenever it changes; a faint line at
+  // each day change instead of a label per gap.
+  const every = Math.max(1, Math.round(times.length / 7));
+  let lastDay = null, lastX = -999;
   times.forEach((t, i) => {
-    if (i % every === 0 || i === times.length - 1) g += `<text x="${X(t)}" y="${H-8}" text-anchor="middle" font-size="11" fill="var(--mute)">${hh(t)}</text>`;
-    if (i > 0 && t - times[i-1] > 1800) g += `<line x1="${X(t)}" x2="${X(t)}" y1="${T}" y2="${H-B}" stroke="var(--mute)" stroke-dasharray="2,4" opacity=".6"/><text x="${X(t)+3}" y="${T+10}" font-size="10" fill="var(--mute)">${dayOf(t)} ${hh(t)}</text>`;
+    if (i > 0 && day(t) !== day(times[i-1])) g += `<line x1="${X(t)}" x2="${X(t)}" y1="${T}" y2="${H-B}" stroke="var(--mute)" stroke-dasharray="2,4" opacity=".45"/>`;
+    if ((i % every === 0 || i === times.length - 1) && X(t) - lastX > 70){
+      const lab = day(t) !== lastDay ? `${day(t)} ${hh(t)}` : hh(t);
+      g += `<text x="${X(t)}" y="${H-9}" text-anchor="middle" font-size="12" fill="var(--mute)">${lab}</text>`;
+      lastDay = day(t); lastX = X(t);
+    }
   });
+  const cols = {}, ends = [];
   const lines = shown.map(t => {
-    const col = PALETTE[d.teams.indexOf(t) % PALETTE.length];
+    const col = cols[t.rid] = PALETTE[d.teams.indexOf(t) % PALETTE.length];
     let path = '', prev = null;
     for (const p of t.series){
       if (p[idx] == null){ prev = null; continue; }
       path += (prev === null || p[0] - prev > 1800 ? 'M' : 'L') + `${X(p[0]).toFixed(1)},${Y(p[idx]).toFixed(1)} `; prev = p[0];
     }
     const last = [...t.series].reverse().find(p => p[idx] != null);
-    if (!last) return '';
-    return `<path d="${path}" fill="none" stroke="${col}" stroke-width="${t.me ? 2.5 : 1.5}" ${t.me ? '' : 'opacity=".85"'}/>
-      <text x="${X(last[0]) + 4}" y="${Y(last[idx]) + 4}" font-size="11" fill="${col}">${mode === 'chop' ? Math.round(last[idx]) + '%' : last[idx].toFixed(1)}</text>`;
+    if (last && !(mode === 'chop' && last[idx] < 0.5 && !t.me)) ends.push({x: X(last[0]), y: Y(last[idx]), text: fmt(last[idx]), col});
+    return `<path d="${path}" fill="none" stroke="${col}" stroke-width="${t.me ? 2.5 : 1.6}" ${t.me ? '' : 'opacity=".9"'}/>`;
   }).join('');
+  // End-of-line values, nudged apart so they don't overprint.
+  // Stack from the bottom up so a pile at 0 doesn't spill under the axis.
+  ends.sort((a, b) => b.y - a.y);
+  for (let i = 0; i < ends.length; i++){
+    ends[i].y = Math.min(ends[i].y, H - B - 2);
+    if (i && ends[i-1].y - ends[i].y < 13) ends[i].y = ends[i-1].y - 13;
+  }
+  const labels = ends.map(e => `<text x="${e.x + 5}" y="${e.y + 4}" font-size="12" fill="${e.col}">${e.text}</text>`).join('');
+  chartState[l.league_id] = {times, W, L, R, T, H, B, x1, idx, mode,
+    teams: shown.map(t => ({name: t.name + (t.me ? ' (you)' : ''), col: cols[t.rid], pts: new Map(t.series.map(p => [p[0], p[idx]]))}))};
+  const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block;font-family:'IBM Plex Mono',monospace">${g}${lines}${labels}
+    <line class="xhair" x1="0" x2="0" y1="${T}" y2="${H-B}" stroke="var(--ink)" stroke-width="1" opacity=".35" visibility="hidden"/>
+    <rect x="${L}" y="${T}" width="${W-L-R}" height="${H-T-B}" fill="transparent" onmousemove="chartHover(evt,'${l.league_id}')" onmouseleave="chartHover(null,'${l.league_id}')"/></svg>
+    <div class="ctip" style="display:none"></div>`;
+  return chartFrame(l, d, svg);
+}
+
+function chartFrame(l, d, inner){
+  const sel = chartSel[l.league_id] || new Set();
   const legend = d.teams.map(t => { const col = PALETTE[d.teams.indexOf(t) % PALETTE.length], on = sel.has(t.rid);
     return `<label class="lg-item" style="opacity:${on ? 1 : .45}"><input type="checkbox" ${on ? 'checked' : ''} onclick="event.stopPropagation();chartToggleTeam('${l.league_id}','${t.rid}')"> <span style="color:${col}">■</span> ${t.name}${t.me ? ' (you)' : ''}</label>`; }).join('');
   return `<div class="chartwrap" onclick="event.stopPropagation()">
@@ -2772,9 +2806,36 @@ function historyChart(l, d){
       <a href="#" class="${chartMode === 'pts' ? 'on' : ''}" onclick="chartMode='pts';tick();return false">live points</a>${d.has_chop ? ` ·
       <a href="#" class="${chartMode === 'chop' ? 'on' : ''}" onclick="chartMode='chop';tick();return false">chop %</a>` : ''}
       <span class="pos"> · <a href="#" onclick="chartSel['${l.league_id}']=new Set(${JSON.stringify(d.teams.map(t=>t.rid))});tick();return false">all</a> · <a href="#" onclick="chartSel['${l.league_id}']=new Set();tick();return false">none</a></span></div>
-    <svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block;font-family:'IBM Plex Mono',monospace">${g}${lines}</svg>
+    <div class="cplot">${inner}</div>
     <div class="legend">${legend}</div>
   </div>`;
+}
+
+// Hover: crosshair at the nearest snapshot and every plotted team's value then.
+function chartHover(evt, lid){
+  const st = chartState[lid];
+  const plot = evt ? evt.target.closest('.cplot') : document.querySelector(`.cplot`);
+  if (!st || !plot) return;
+  const tip = plot.querySelector('.ctip'), xh = plot.querySelector('.xhair');
+  if (!evt){ tip.style.display = 'none'; xh.setAttribute('visibility', 'hidden'); return; }
+  const svg = evt.target.ownerSVGElement, r = svg.getBoundingClientRect();
+  const sx = (evt.clientX - r.left) / r.width * st.W;
+  const i = Math.max(0, Math.min(st.times.length - 1, Math.round((sx - st.L) / (st.W - st.L - st.R) * st.x1)));
+  const t = st.times[i], x = st.L + i / st.x1 * (st.W - st.L - st.R);
+  xh.setAttribute('x1', x); xh.setAttribute('x2', x); xh.setAttribute('visibility', 'visible');
+  const valAt = m => { if (m.has(t)) return m.get(t); let best = null; for (const [k, v] of m) if (k <= t && v != null) best = v; return best; };
+  let rows = st.teams.map(tm => ({...tm, v: valAt(tm.pts)})).filter(tm => tm.v != null).sort((a, b) => b.v - a.v);
+  // Chop mode: teams at ~0% just add noise; keep yourself, count the rest.
+  const zero = st.mode === 'chop' ? rows.filter(tm => tm.v < 0.5 && !tm.name.endsWith('(you)')).length : 0;
+  if (zero) rows = rows.filter(tm => tm.v >= 0.5 || tm.name.endsWith('(you)'));
+  const dt = new Date(t * 1000);
+  tip.innerHTML = `<div class="pos" style="margin-bottom:3px">${dt.toLocaleDateString(undefined, {weekday: 'short'})} ${dt.getHours()}:${String(dt.getMinutes()).padStart(2, '0')}</div>` +
+    rows.map(tm => `<div><span style="color:${tm.col}">■</span> ${tm.name} <b class="num">${st.mode === 'chop' ? Math.round(tm.v) + '%' : tm.v.toFixed(1)}</b></div>`).join('') +
+    (zero ? `<div class="pos">+${zero} at 0%</div>` : '');
+  tip.style.display = 'block';
+  const pr = plot.getBoundingClientRect(), px = evt.clientX - pr.left;
+  tip.style.left = (px + 14 + tip.offsetWidth > pr.width ? px - tip.offsetWidth - 14 : px + 14) + 'px';
+  tip.style.top = '8px';
 }
 
 let chartLeague = null;     // league_id shown in the chart section
