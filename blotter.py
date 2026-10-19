@@ -52,6 +52,9 @@ CONFIG = {
     "pending_chop": {},          # e.g. {"1389721132256473088": "kickersvingames"}
     # Default league for the waiver and chart sections.
     "favorite_league": "1400335104223485952",   # Paris in 1795v2
+    # Pools with "get out of jail" cards (a bench player subbed in after the
+    # fact): show each team's projected final with its best 1-3 swaps.
+    "jail_cards": ["1389721132256473088"],      # Degenerates
     # Pools that pay the week's high score: league_id -> $ per week (None =
     # amount unknown, just count wins).
     "weekly_prize": {"1400335104223485952": None},   # Paris
@@ -682,6 +685,27 @@ def best_lineup_slots(player_ids, slots, value, players):
             picked[i] = (slot, best)
             del avail[best]
     return [picked[i] for i, _ in named if i in picked]
+
+
+def jail_totals(starters, slots, bench, value, players, max_cards=3):
+    """Lineup total with the best 0..max_cards swaps, each swap a bench
+    player taking one starter's slot (eligible positions only). Exhaustive
+    over the top swaps; rosters are small."""
+    import itertools
+    named = [s for s in slots if s not in NON_SLOTS]
+    st = list(zip(named, starters))
+    base = sum(value(p) for _, p in st if p and p != "0")
+    pairs = sorted(((i, bp, value(bp) - (value(sp) if sp and sp != "0" else 0.0))
+                    for i, (sl, sp) in enumerate(st) for bp in bench
+                    if players.get(bp, {}).get("pos") in ELIGIBLE.get(sl, {sl})),
+                   key=lambda x: -x[2])
+    pairs = [x for x in pairs if x[2] > 0][:30]
+    out = [base]
+    for k in range(1, max_cards + 1):
+        g = max((sum(x[2] for x in c) for c in itertools.combinations(pairs, k)
+                 if len({x[0] for x in c}) == k and len({x[1] for x in c}) == k), default=0.0)
+        out.append(max(out[-1], base + g))
+    return [round(v, 2) for v in out]
 
 
 def chop_line(sorted_field, idx, key):
@@ -1329,6 +1353,17 @@ def build():
             key=lambda x: x["pts"],
         )
         my_lineup, my_proj, my_det = proj_by_rid.get(my_rid, ([], {}, {}))
+        if lid in CONFIG["jail_cards"]:
+            # Projected final (act + proj x remaining) for everyone on the roster.
+            by_m = {m["roster_id"]: m for m in matchups}
+            for f in field:
+                m = by_m[f["rid"]]
+                act = m.get("players_points") or {}
+                fin = lambda p: (act.get(p) or 0.0) + (proj_pts(p, projections, scoring) or 0.0) * games.get(
+                    p if p in games else players.get(p, {}).get("team"), 1.0)
+                starters = m.get("starters") or []
+                bench = [p for p in m.get("players") or [] if p not in starters]
+                f["jail"] = jail_totals(starters, lg.get("roster_positions") or [], bench, fin, players)[1:]
 
         entry = {
             "league_id": lid,
@@ -2887,9 +2922,10 @@ function poolDetail(l){
   const lrank = Object.fromEntries(l.field.map((t,i) => [t.rid, n - i]));
   const me = l.my_rid;
   const proj = [...l.field].sort((a,b) => b.proj - a.proj);
+  const jail = l.field.some(t => t.jail);
   return `<div class="detail">
     <h3>Field · by proj final (chop line above the last row) · live rank in grey</h3>
-    <table><tr><th class="rk">#</th><th>Team</th><th class="r">Chop %</th>${l.prize ? '<th class="r" title="share of sims with the week\'s high score">Top %</th>' : ''}<th class="r" title="FAAB left — a high budget on the chop line leaves the league with them">FAAB</th><th class="r">Proj final</th><th class="r">Pts</th><th class="r">To play</th><th class="r">Live #</th></tr>
+    <table><tr><th class="rk">#</th><th>Team</th><th class="r">Chop %</th>${l.prize ? '<th class="r" title="share of sims with the week\'s high score">Top %</th>' : ''}<th class="r" title="FAAB left — a high budget on the chop line leaves the league with them">FAAB</th>${jail ? '<th class="r" title="projected final if the team uses its best 1 / 2 / 3 get-out-of-jail swaps (bench player subbed in)">Jail 1 · 2 · 3</th>' : ''}<th class="r">Proj final</th><th class="r">Pts</th><th class="r">To play</th><th class="r">Live #</th></tr>
     ${proj.map((t,i) => {
       const key = `team:${l.league_id}:${t.rid}`, isOpen = open.has(key);
       return `<tr class="${t.rid === me ? 'me' : ''} ${i === n - 2 ? 'line' : ''} trow" onclick="event.stopPropagation();toggle('${key}')">
@@ -2897,10 +2933,11 @@ function poolDetail(l){
       <td class="r num ${t.chop_pct >= 15 ? 'short' : ''}">${Math.round(t.chop_pct)}</td>
       ${l.prize ? `<td class="r num ${t.top_pct >= 15 ? 'long' : 'pos'}">${t.top_pct == null ? '—' : Math.round(t.top_pct)}</td>` : ''}
       <td class="r num pos">${t.faab == null ? '—' : t.faab}</td>
+      ${jail ? `<td class="r num pos" style="font-size:12px">${(t.jail || []).map(v => v.toFixed(1)).join(' · ')}</td>` : ''}
       <td class="r num">${f2(t.proj)}</td><td class="r num">${f2(t.pts)}</td>
       <td class="r num pos">${t.to_play[0]}${t.to_play[1] ? `<span style="color:var(--warn)"> ·${t.to_play[1]}</span>` : ''}</td>
       <td class="r num pos">${lrank[t.rid]}</td></tr>
-      ${isOpen && t.lineup ? `<tr class="tdetail"><td colspan="${l.prize ? 9 : 8}">${lineupTable(t.name, t.lineup)}</td></tr>` : ''}`;
+      ${isOpen && t.lineup ? `<tr class="tdetail"><td colspan="${(l.prize ? 9 : 8) + (jail ? 1 : 0)}">${lineupTable(t.name, t.lineup)}</td></tr>` : ''}`;
     }).join('')}
     </table>
     ${l.prize ? prizeBlock(l) : ''}
