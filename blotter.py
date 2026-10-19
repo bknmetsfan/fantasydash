@@ -1099,6 +1099,9 @@ def log_snapshot(season, week, leagues):
                      lg.get("rank"), lg.get("field_size"), tp[0], tp[1]))
     con.executemany("INSERT INTO players VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", prow)
     con.executemany("INSERT OR REPLACE INTO team_snaps VALUES (?,?,?,?,?,?,?)", team_rows(prow))
+    con.executemany("INSERT OR REPLACE INTO chop_snaps VALUES (?,?,?,?,?,?)",
+                    [(season, week, lg["league_id"], ts, str(f["rid"]), f["chop_pct"])
+                     for lg in leagues if lg.get("mode") == "pool" for f in lg.get("field") or [] if "chop_pct" in f])
     con.executemany("INSERT INTO leagues VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", lrow)
     con.executemany("INSERT OR REPLACE INTO teams VALUES (?,?,?,?,?)", trow)
     con.commit()
@@ -1112,6 +1115,9 @@ TEAM_SNAPS_DDL = """
             season TEXT, week INTEGER, league_id TEXT, ts INTEGER, rid TEXT, pts REAL, proj REAL,
             PRIMARY KEY (season, league_id, week, ts, rid));
         CREATE INDEX IF NOT EXISTS leagues_lg ON leagues (league_id, week);
+        CREATE TABLE IF NOT EXISTS chop_snaps (
+            season TEXT, week INTEGER, league_id TEXT, ts INTEGER, rid TEXT, chop REAL,
+            PRIMARY KEY (season, league_id, week, ts, rid));
 """
 
 
@@ -2337,6 +2343,11 @@ def history_payload(lid, week, season):
             prev = t
     keep_set = set(keep)
     series = {rid: [pt for pt in v if pt[0] in keep_set] for rid, v in series.items()}
+    con = connect_log()
+    chop = {(ts, rid): c for ts, rid, c in con.execute(
+        "SELECT ts, rid, chop FROM chop_snaps WHERE season=? AND league_id=? AND week=?", (season, lid, week))}
+    con.close()
+    series = {rid: [pt + [chop.get((pt[0], rid))] for pt in v] for rid, v in series.items()}
     step = max(1, max((len(v) for v in series.values()), default=1) // 400)
     my_rid = str((live or {}).get("my_rid", ""))
     opp = (live or {}).get("opp_name")
@@ -2345,7 +2356,41 @@ def history_payload(lid, week, season):
               "series": v[::step] + ([v[-1]] if (len(v) - 1) % step else [])}
              for rid, v in series.items()]
     teams.sort(key=lambda t: -t["series"][-1][2])
-    return {"week": week, "weeks": weeks, "league_id": lid, "mode": (live or {}).get("mode"), "teams": teams}
+    return {"week": week, "weeks": weeks, "league_id": lid, "mode": (live or {}).get("mode"), "teams": teams,
+            "has_chop": bool(chop)}
+
+
+def backfill_chop(lid, week, season=None, sims=3000):
+    """Chop % for past snapshots of a pool, rebuilt from the players log:
+    every team's act/proj/rem at that moment through the same simulation.
+    Only the snapshots the chart plots (action points), only where missing."""
+    season = season or CONFIG["season"]
+    payload = history_payload(lid, week, season)
+    stamps = sorted({p[0] for t in payload["teams"] for p in t["series"] if p[3] is None})
+    con = connect_log()
+    done = 0
+    for i in range(0, len(stamps), 50):
+        chunk = stamps[i:i + 50]
+        rows = con.execute(
+            "SELECT ts, rid, pid, pos, act, proj, rem FROM players WHERE season=? AND week=? AND league_id=? AND ts IN (%s)"
+            % ",".join("?" * len(chunk)), (season, week, lid, *chunk)).fetchall()
+        by_ts = {}
+        for ts, rid, pid, pos, act, proj, rem in rows:
+            by_ts.setdefault(ts, {}).setdefault(rid, {})[pid] = {"act": act, "proj": proj, "rem": rem, "pos": pos}
+        out = []
+        for ts, dets in by_ts.items():
+            rids = list(dets)
+            sm = simulate(dets, sims)
+            low = np.array([sm[r] for r in rids]).argmin(axis=0)
+            share = np.bincount(low, minlength=len(rids)) / len(low)
+            out += [(season, week, lid, ts, r, round(100 * float(c), 1)) for r, c in zip(rids, share)]
+        con.executemany("INSERT OR REPLACE INTO chop_snaps VALUES (?,?,?,?,?,?)", out)
+        con.commit()
+        done += len(by_ts)
+    con.close()
+    _hist_cache.pop((lid, week), None)
+    _hist_cache.pop((lid, None), None)
+    return done
 
 
 @app.route("/api/waivers/<lid>")
@@ -2645,7 +2690,8 @@ function historyChart(l, d){
     chartSel[l.league_id] = new Set([...bottom, ...d.teams.filter(t => t.me || t.opp).map(t => t.rid)]);
   }
   const sel = chartSel[l.league_id];
-  const idx = chartMode === 'proj' ? 2 : 1;
+  const mode = chartMode === 'chop' && !d.has_chop ? 'proj' : chartMode;
+  const idx = {proj: 2, pts: 1, chop: 3}[mode];
   const shown = d.teams.filter(t => sel.has(t.rid));
   const W = 820, H = 300, L = 44, R = 46, T = 10, B = 28;
   const all = shown.flatMap(t => t.series);
@@ -2654,8 +2700,8 @@ function historyChart(l, d){
   const times = [...new Set(d.teams.flatMap(t => t.series.map(p => p[0])))].sort((a, b) => a - b);
   const xi = new Map(times.map((t, i) => [t, i]));
   const x0 = 0, x1 = Math.max(1, times.length - 1);
-  const ys = all.map(p => p[idx]);
-  let y0 = Math.min(...ys, chartMode === 'pts' ? 0 : Infinity), y1 = Math.max(...ys);
+  const ys = all.map(p => p[idx]).filter(v => v != null);
+  let y0 = Math.min(...ys, mode !== 'proj' ? 0 : Infinity), y1 = Math.max(...ys);
   if (!isFinite(y0) || !isFinite(y1)) return '<div class="pos">Pick a team to plot.</div>';
   if (y1 - y0 < 10) y1 = y0 + 10;
   const pad = (y1 - y0) * 0.05; y0 -= pad; y1 += pad;
@@ -2674,17 +2720,22 @@ function historyChart(l, d){
   const lines = shown.map(t => {
     const col = PALETTE[d.teams.indexOf(t) % PALETTE.length];
     let path = '', prev = null;
-    for (const p of t.series){ path += (prev === null || p[0] - prev > 1800 ? 'M' : 'L') + `${X(p[0]).toFixed(1)},${Y(p[idx]).toFixed(1)} `; prev = p[0]; }
-    const last = t.series[t.series.length - 1];
+    for (const p of t.series){
+      if (p[idx] == null){ prev = null; continue; }
+      path += (prev === null || p[0] - prev > 1800 ? 'M' : 'L') + `${X(p[0]).toFixed(1)},${Y(p[idx]).toFixed(1)} `; prev = p[0];
+    }
+    const last = [...t.series].reverse().find(p => p[idx] != null);
+    if (!last) return '';
     return `<path d="${path}" fill="none" stroke="${col}" stroke-width="${t.me ? 2.5 : 1.5}" ${t.me ? '' : 'opacity=".85"'}/>
-      <text x="${X(last[0]) + 4}" y="${Y(last[idx]) + 4}" font-size="11" fill="${col}">${last[idx].toFixed(1)}</text>`;
+      <text x="${X(last[0]) + 4}" y="${Y(last[idx]) + 4}" font-size="11" fill="${col}">${mode === 'chop' ? Math.round(last[idx]) + '%' : last[idx].toFixed(1)}</text>`;
   }).join('');
   const legend = d.teams.map(t => { const col = PALETTE[d.teams.indexOf(t) % PALETTE.length], on = sel.has(t.rid);
     return `<label class="lg-item" style="opacity:${on ? 1 : .45}"><input type="checkbox" ${on ? 'checked' : ''} onclick="event.stopPropagation();chartToggleTeam('${l.league_id}','${t.rid}')"> <span style="color:${col}">■</span> ${t.name}${t.me ? ' (you)' : ''}</label>`; }).join('');
   return `<div class="chartwrap" onclick="event.stopPropagation()">
     <div class="chartbar"><span class="pos">week <select onchange="chartSetWeek('${l.league_id}',+this.value)">${(d.weeks || [d.week]).map(w => `<option value="${w}" ${w === d.week ? 'selected' : ''}>${w}</option>`).join('')}</select> · </span>
       <a href="#" class="${chartMode === 'proj' ? 'on' : ''}" onclick="chartMode='proj';tick();return false">projected final</a> ·
-      <a href="#" class="${chartMode === 'pts' ? 'on' : ''}" onclick="chartMode='pts';tick();return false">live points</a>
+      <a href="#" class="${chartMode === 'pts' ? 'on' : ''}" onclick="chartMode='pts';tick();return false">live points</a>${d.has_chop ? ` ·
+      <a href="#" class="${chartMode === 'chop' ? 'on' : ''}" onclick="chartMode='chop';tick();return false">chop %</a>` : ''}
       <span class="pos"> · <a href="#" onclick="chartSel['${l.league_id}']=new Set(${JSON.stringify(d.teams.map(t=>t.rid))});tick();return false">all</a> · <a href="#" onclick="chartSel['${l.league_id}']=new Set();tick();return false">none</a></span></div>
     <svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block;font-family:'IBM Plex Mono',monospace">${g}${lines}</svg>
     <div class="legend">${legend}</div>
