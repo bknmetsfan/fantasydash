@@ -1163,6 +1163,24 @@ def log_rows(rid, mine, det, players):
             for pid, d in det.items()]
 
 
+_past_pf = {}              # (league_id, week) -> {rid: PF over weeks 1..week-1}
+
+
+def past_pf(lid, week):
+    """PF summed over completed weeks from the matchups, to tell whether
+    Sleeper's roster totals (fpts/ppts) already include `week`: Sleeper
+    folds a finished week in at some point after it ends, and adding the
+    live week on top of that would count it twice."""
+    hit = _past_pf.get((lid, week))
+    if hit is None:
+        hit = {}
+        for w in range(1, week):
+            for m in get(f"/league/{lid}/matchups/{w}") or []:
+                hit[m["roster_id"]] = hit.get(m["roster_id"], 0.0) + (m.get("points") or 0.0)
+        _past_pf[(lid, week)] = hit
+    return hit
+
+
 _prize_weeks = {}          # (league_id, week) -> that week's final scores; completed weeks only
 
 
@@ -1487,6 +1505,29 @@ def build():
             ranked = sorted((t for t in entry["standings"] if t["max_pf"] is not None), key=lambda t: -t["max_pf"])
             for i, t in enumerate(ranked):
                 t["max_pf_rank"] = i + 1
+            # Live Max PF race: Sleeper's ppts covers completed weeks; add this
+            # week's optimal lineup on points so far and on projected finals.
+            if ranked:
+                rp = lg.get("roster_positions") or []
+                past = past_pf(lid, week)
+                for t in ranked:
+                    m = by_roster.get(t["rid"])
+                    if not m:
+                        continue
+                    pp = m.get("players_points") or {}
+                    ids = [p for p in (m.get("players") or []) if p and p != "0"]
+                    act = lambda p: pp.get(p) or 0.0
+                    fin = lambda p: blended(p, pp, projections, scoring, players, games)
+                    now = sum(act(p) for p in best_lineup(ids, rp, act, players))
+                    final = sum(fin(p) for p in best_lineup(ids, rp, fin, players))
+                    pts = m.get("points") or 0.0
+                    folded = pts > 0 and abs(t["pf"] - past.get(t["rid"], 0.0) - pts) < 0.5
+                    base = t["max_pf"] - (now if folded else 0.0)
+                    t.update({"max_wk": round(now, 2), "max_wk_proj": round(final, 2),
+                              "max_live": round(base + now, 2), "max_proj": round(base + final, 2)})
+                live = sorted((t for t in ranked if "max_proj" in t), key=lambda t: -t["max_proj"])
+                for i, t in enumerate(live):
+                    t["max_proj_rank"] = i + 1
             entry["my_rid"] = my_rid
             if opp_m:
                 entry["opp_name"] = team_name(opp_m["roster_id"])
@@ -3033,7 +3074,22 @@ function h2hDetail(l){
       <td class="rk num">${i+1}</td><td>${t.name}</td>
       <td class="r num">${t.w}-${t.l}${t.t ? '-' + t.t : ''}</td><td class="r num">${f2(t.pf)}</td>
       ${mx ? `<td class="r num">${t.max_pf == null ? '—' : `${f2(t.max_pf)} <span class="pos" style="font-size:11px">#${t.max_pf_rank}</span>`}</td>` : ''}</tr>`).join('')}`; })()}
-    </table></div>`;
+    </table>
+    ${maxRace(l)}</div>`;
+}
+
+function maxRace(l){
+  // Live Max PF, lowest first (Dynasty Degenrates: lowest Max PF picks first
+  // among non-playoff teams): completed weeks + this week's optimal lineup.
+  const rows = (l.standings || []).filter(t => t.max_proj != null).sort((a,b) => a.max_proj - b.max_proj);
+  if (!rows.length) return '';
+  return `<h3>Max PF race · lowest first · completed weeks + this week's optimal lineup</h3>
+    <table><tr><th>Team</th><th class="r" title="Sleeper, completed weeks">Max PF</th><th class="r" title="optimal lineup on points so far">This wk</th>
+      <th class="r" title="optimal lineup on projected finals">Wk proj</th><th class="r">Live</th><th class="r" title="rank in grey, 1 = highest">Proj total</th></tr>
+    ${rows.map(t => `<tr class="${t.rid === l.my_rid ? 'me' : ''}"><td>${t.name}</td>
+      <td class="r num pos">${f2(t.max_live - t.max_wk)}</td><td class="r num">${f2(t.max_wk)}</td><td class="r num pos">${f2(t.max_wk_proj)}</td>
+      <td class="r num">${f2(t.max_live)}</td><td class="r num">${f2(t.max_proj)} <span class="pos" style="font-size:11px">#${t.max_proj_rank}</span></td></tr>`).join('')}
+    </table>`;
 }
 
 function prizeBlock(l){
