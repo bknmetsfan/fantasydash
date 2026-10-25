@@ -3,18 +3,24 @@
     "name": "Eliminator.gg",
     "scoring": "eliminator",
     "starters": [
-      "Kirk Cousins",
-      "D'Andre Swift",
-      "Kenneth Walker",
-      "Drake London",
-      "Germie Bernard",
-      "Xavier Worthy",
-      "George Kittle",
+      "Brock Purdy",
+      "Javonte Williams",
+      "Derrick Henry",
+      "Nico Collins",
       {
-        "name": "Brock Bowers",
+        "name": "KC Concepcion",
+        "mult": 1.5
+      },
+      {
+        "name": "Brandin Cooks",
+        "mult": 1.5
+      },
+      "Tyler Higbee",
+      {
+        "name": "Bijan Robinson",
         "mult": 1.5
       }
     ],
-    "week": 6
+    "week": 7
   }
 ]
