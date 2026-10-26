@@ -2419,6 +2419,13 @@ def history_payload(lid, week, season):
             prev = t
     keep_set = set(keep)
     series = {rid: [pt for pt in v if pt[0] in keep_set] for rid, v in series.items()}
+    # Teams already eliminated can turn up in a stray early snapshot (logged
+    # before the chop ran); anyone who stops appearing before the week's
+    # midpoint wasn't really in it. A team chopped at the end of a past week
+    # played it in full, so it stays.
+    if len(keep) > 1:
+        mid = keep[len(keep) // 2]
+        series = {rid: v for rid, v in series.items() if v and v[-1][0] >= mid}
     con = connect_log()
     chop = {(ts, rid): c for ts, rid, c in con.execute(
         "SELECT ts, rid, chop FROM chop_snaps WHERE season=? AND league_id=? AND week=?", (season, lid, week))}
