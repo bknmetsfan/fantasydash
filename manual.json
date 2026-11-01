@@ -3,24 +3,18 @@
     "name": "Eliminator.gg",
     "scoring": "eliminator",
     "starters": [
-      "Brock Purdy",
-      "Javonte Williams",
-      "Derrick Henry",
-      "Nico Collins",
+      "Dak Prescott",
+      "Chase Brown",
+      "Rhamondre Stevenson",
+      "CeeDee Lamb",
+      "DJ Moore",
+      "Makai Lemon",
+      "Greg Dulcich",
       {
-        "name": "KC Concepcion",
-        "mult": 1.5
-      },
-      {
-        "name": "Brandin Cooks",
-        "mult": 1.5
-      },
-      "Tyler Higbee",
-      {
-        "name": "Bijan Robinson",
+        "name": "James Cook",
         "mult": 1.5
       }
     ],
-    "week": 7
+    "week": 8
   }
 ]
