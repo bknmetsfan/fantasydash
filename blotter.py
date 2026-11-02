@@ -911,8 +911,10 @@ def load_espn(week, players, games, stats):
 
     swid = (cfg.get("swid") or "").strip("{}").lower()
     by_espn = {p["espn_id"]: pid for pid, p in players.items() if p.get("espn_id")}
+    # Rostered players first: "Kenneth Walker" must hit Walker III (KC), not a
+    # free-agent namesake whose missing team reads as a game still to play.
     by_name = {}
-    for pid, p in players.items():
+    for pid, p in sorted(players.items(), key=lambda kv: kv[1].get("team") in (None, "", "FA")):
         by_name.setdefault(norm(p["name"]), pid)
     extras = {}
 
