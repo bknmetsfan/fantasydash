@@ -3,18 +3,18 @@
     "name": "Eliminator.gg",
     "scoring": "eliminator",
     "starters": [
-      "Dak Prescott",
-      "Chase Brown",
-      "Rhamondre Stevenson",
-      "CeeDee Lamb",
-      "DJ Moore",
-      "Makai Lemon",
-      "Greg Dulcich",
+      "Drake Maye",
+      "Ollie Gordon II",
+      "Jonah Coleman",
+      "Puka Nacua",
+      "Antonio Williams",
+      "DeMario Douglas",
+      "Sam LaPorta",
       {
-        "name": "James Cook",
+        "name": "D'Andre Swift",
         "mult": 1.5
       }
     ],
-    "week": 8
+    "week": 9
   }
 ]
