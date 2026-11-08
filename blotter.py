@@ -491,8 +491,9 @@ def load_plays():
     return _plays_cache
 
 
-# 'J.Gibbs', and ESPN's two-letter disambiguation 'Mi.Wilson' / 'Ma.Wilson'.
-_INITIAL_LAST = re.compile(r"\b([A-Z][a-z]?)\.\s?([A-Z][A-Za-z'\-]+)")
+# 'J.Gibbs', ESPN's two-letter disambiguation 'Mi.Wilson' / 'Ma.Wilson', and
+# two-word surnames such as 'A.St. Brown'.
+_INITIAL_LAST = re.compile(r"\b([A-Z][a-z]?)\.\s?((?:St\.\s?|Van\s|Von\s)?[A-Z][A-Za-z'\-]+)")
 
 
 _FG_DIST = re.compile(r"(\d+) yard field goal", re.I)
@@ -574,9 +575,12 @@ def build_feed(book, players=None, scoring_by_tag=None):
     by_name, by_last = {}, {}
     for p in book:
         by_name[norm(p["name"])] = p
-        parts = p["name"].split()
-        if parts:
-            by_last.setdefault((norm(parts[-1]), p["team"]), []).append(p)
+        # Surname keys for 'J.Gibbs'-style play text: drop "Jr."/"III" first
+        # (ESPN writes K.Walker, not K.Walker III), and also key the last two
+        # words so two-word surnames match ('A.St. Brown' -> "stbrown").
+        parts = _SUFFIX.sub("", p["name"]).split()
+        for key in {norm(parts[-1]), norm(" ".join(parts[-2:]))} if parts else ():
+            by_last.setdefault((key, p["team"]), []).append(p)
 
     def by_prefix(ini, last, team):
         cands = [c for c in by_last.get((norm(last), team), []) if c["name"].lower().startswith(ini.lower())]
