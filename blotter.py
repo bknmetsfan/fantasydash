@@ -611,7 +611,11 @@ def build_feed(book, players=None, scoring_by_tag=None):
             if not hits:
                 # No participant list: read 'J.Love pass ... to C.Watson' style text.
                 # First name token is the passer/rusher, the one after 'to' the receiver.
-                for mt in _INITIAL_LAST.finditer(text):
+                # Names in parentheses are defenders ("for 7 yards (J.Love)."):
+                # blank them out, keeping offsets, so a tackler can't pass for
+                # one of my players with the same initial and surname.
+                scan = re.sub(r"\([^)]*\)", lambda m: " " * len(m.group()), text)
+                for mt in _INITIAL_LAST.finditer(scan):
                     ini, last = mt.groups()
                     for t in game_teams:
                         hit = by_prefix(ini, last, t)
@@ -620,8 +624,8 @@ def build_feed(book, players=None, scoring_by_tag=None):
                         hits[hit["id"]] = hit
                         # Role from the words around the name, not its position:
                         # pre-snap notes ("A.Belton reported in as eligible.") come first.
-                        before = text[max(0, mt.start() - 14):mt.start()].lower()
-                        after = text[mt.end():mt.end() + 24].lower()
+                        before = scan[max(0, mt.start() - 14):mt.start()].lower()
+                        after = scan[mt.end():mt.end() + 24].lower()
                         if after.startswith(" pass") or after.startswith(" scrambles") or after.startswith(" sacked"):
                             role = "rush" if after.startswith(" scrambles") else "pass"
                         elif before.endswith("to ") or before.endswith("for ") or " to " in before[-4:]:
