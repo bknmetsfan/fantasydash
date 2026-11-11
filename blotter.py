@@ -58,9 +58,10 @@ CONFIG = {
     # listed gets 3. Update when someone uses one.
     "jail_cards": {"1389721132256473088": {      # Degenerates, as of Week 9
         "SergioColon85": 3, "czhao724": 2, "ChrisPL": 1, "DrFunk99": 1, "RobertBull44": 0}},
-    # Pools that pay the week's high score: league_id -> $ per week (None =
-    # amount unknown, just count wins).
-    "weekly_prize": {"1400335104223485952": None},   # Paris
+    # Pools that pay the week's high score: league_id -> {"amount": $ per week
+    # (None = unknown, just count wins), "last_week": last week that pays}.
+    # Paris: $50 buy-in, $10 a week for weeks 1-15 (16-17 are in the money anyway).
+    "weekly_prize": {"1400335104223485952": {"amount": 10, "last_week": 15}},   # Paris
     "shared_leagues": [
         "1400335104223485952",   # Paris in 1795v2
         "1389721132256473088",   # Degenerates
@@ -1202,9 +1203,10 @@ def weekly_prize(lid, week, field):
     (from Sleeper's matchups, so chopped teams count for the weeks they
     played), the season tally, and this week's live and projected leader."""
     names = roster_names(lid)
-    amount = CONFIG["weekly_prize"].get(lid)
+    rule = CONFIG["weekly_prize"].get(lid) or {}
+    amount, last = rule.get("amount"), rule.get("last_week") or 99
     weeks = []
-    for w in range(1, week):
+    for w in range(1, min(week, last + 1)):
         if (lid, w) not in _prize_weeks:
             pts = {str(m["roster_id"]): m["points"] for m in get(f"/league/{lid}/matchups/{w}") or [] if m.get("points")}
             if not pts:
