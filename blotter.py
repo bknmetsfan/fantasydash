@@ -492,9 +492,10 @@ def load_plays():
     return _plays_cache
 
 
-# 'J.Gibbs', ESPN's two-letter disambiguation 'Mi.Wilson' / 'Ma.Wilson', and
+# 'J.Gibbs', ESPN's disambiguation 'Mi.Wilson' / 'Ma.Wilson' or 'Bri.Thomas' /
+# 'Bry.Thomas' (up to three letters), and
 # two-word surnames such as 'A.St. Brown'.
-_INITIAL_LAST = re.compile(r"\b([A-Z][a-z]?)\.\s?((?:St\.\s?|Van\s|Von\s)?[A-Z][A-Za-z'\-]+)")
+_INITIAL_LAST = re.compile(r"\b([A-Z][a-z]{0,2})\.\s?((?:St\.\s?|Van\s|Von\s)?[A-Z][A-Za-z'\-]+)")
 
 
 _FG_DIST = re.compile(r"(\d+) yard field goal", re.I)
