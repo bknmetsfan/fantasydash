@@ -3,18 +3,18 @@
     "name": "Eliminator.gg",
     "scoring": "eliminator",
     "starters": [
-      "Drake Maye",
-      "Ollie Gordon II",
-      "Jonah Coleman",
-      "Puka Nacua",
+      "Jayden Daniels",
+      "Cam Skattebo",
+      "Omarion Hampton",
+      "Ja'Marr Chase",
+      "KC Concepcion Jr.",
       "Antonio Williams",
-      "DeMario Douglas",
-      "Sam LaPorta",
+      "Darren Waller",
       {
-        "name": "D'Andre Swift",
+        "name": "Bucky Irving",
         "mult": 1.5
       }
     ],
-    "week": 9
+    "week": 12
   }
 ]
